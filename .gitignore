@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# dare runtime
+.dare/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
