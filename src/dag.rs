@@ -23,7 +23,7 @@ pub struct TaskNode {
 }
 
 /// The complete task graph
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskGraph {
     pub name: Option<String>,
     pub description: Option<String>,

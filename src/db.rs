@@ -1,7 +1,9 @@
 //! Database operations for dare
 
 use anyhow::Result;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use chrono::{DateTime, Utc};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::Row;
 use std::path::Path;
 
 use crate::dag::TaskGraph;
@@ -31,7 +33,10 @@ impl Database {
 
     /// Run database migrations
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        // Run migrations manually since we're not using sqlx-cli
+        sqlx::query(include_str!("../migrations/001_initial.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -50,7 +55,7 @@ impl Database {
         .bind(&run.description)
         .bind(run.status.to_string())
         .bind(&run.config_json)
-        .bind(run.created_at)
+        .bind(run.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -58,36 +63,33 @@ impl Database {
 
     /// Get a run by ID
     pub async fn get_run(&self, id: &str) -> Result<Option<Run>> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT * FROM runs WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<SqliteRow> = sqlx::query("SELECT * FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row.map(|r| row_to_run(&r)))
     }
 
     /// Get the most recent run
     pub async fn get_latest_run(&self) -> Result<Option<Run>> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT * FROM runs ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<SqliteRow> =
+            sqlx::query("SELECT * FROM runs ORDER BY created_at DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row.map(|r| row_to_run(&r)))
     }
 
     /// Update run status
     pub async fn update_run_status(&self, id: &str, status: RunStatus) -> Result<()> {
-        let now = chrono::Utc::now();
+        let now = Utc::now().to_rfc3339();
 
         match status {
             RunStatus::Running => {
                 sqlx::query("UPDATE runs SET status = ?, started_at = ? WHERE id = ?")
                     .bind(status.to_string())
-                    .bind(now)
+                    .bind(&now)
                     .bind(id)
                     .execute(&self.pool)
                     .await?;
@@ -95,7 +97,7 @@ impl Database {
             RunStatus::Completed | RunStatus::Failed => {
                 sqlx::query("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?")
                     .bind(status.to_string())
-                    .bind(now)
+                    .bind(&now)
                     .bind(id)
                     .execute(&self.pool)
                     .await?;
@@ -116,38 +118,35 @@ impl Database {
 
     /// Get all tasks for a run
     pub async fn get_tasks(&self, run_id: &str) -> Result<Vec<Task>> {
-        let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT * FROM tasks WHERE run_id = ? ORDER BY wave, id",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<SqliteRow> =
+            sqlx::query("SELECT * FROM tasks WHERE run_id = ? ORDER BY wave, id")
+                .bind(run_id)
+                .fetch_all(&self.pool)
+                .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows.iter().map(row_to_task).collect())
     }
 
     /// Get a specific task
     pub async fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
-        let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT * FROM tasks WHERE id = ?",
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<SqliteRow> = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row.map(|r| row_to_task(&r)))
     }
 
     /// Get running tasks for a run
     pub async fn get_running_tasks(&self, run_id: &str) -> Result<Vec<Task>> {
-        let rows = sqlx::query_as::<_, TaskRow>(
+        let rows: Vec<SqliteRow> = sqlx::query(
             "SELECT * FROM tasks WHERE run_id = ? AND status IN ('spawned', 'executing')",
         )
         .bind(run_id)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows.iter().map(row_to_task).collect())
     }
 
     /// Load task graph from database
@@ -165,8 +164,8 @@ impl Database {
         task_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AgentLog>> {
-        let rows = if let Some(tid) = task_id {
-            sqlx::query_as::<_, AgentLogRow>(
+        let rows: Vec<SqliteRow> = if let Some(tid) = task_id {
+            sqlx::query(
                 "SELECT * FROM agent_logs WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT ?",
             )
             .bind(run_id)
@@ -175,7 +174,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, AgentLogRow>(
+            sqlx::query(
                 "SELECT * FROM agent_logs WHERE run_id = ? ORDER BY created_at DESC LIMIT ?",
             )
             .bind(run_id)
@@ -184,7 +183,7 @@ impl Database {
             .await?
         };
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows.iter().map(row_to_agent_log).collect())
     }
 
     /// Get recent logs (for streaming)
@@ -194,109 +193,75 @@ impl Database {
         task_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AgentLog>> {
-        // Same as get_logs but could filter by timestamp for incremental fetching
         self.get_logs(run_id, task_id, limit).await
     }
 }
 
-// Row types for sqlx
+// Helper functions to convert rows to structs
 
-#[derive(sqlx::FromRow)]
-struct RunRow {
-    id: String,
-    name: String,
-    description: Option<String>,
-    status: String,
-    config_json: Option<String>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<RunRow> for Run {
-    fn from(row: RunRow) -> Self {
-        Run {
-            id: row.id,
-            name: row.name,
-            description: row.description,
-            status: match row.status.as_str() {
-                "running" => RunStatus::Running,
-                "paused" => RunStatus::Paused,
-                "completed" => RunStatus::Completed,
-                "failed" => RunStatus::Failed,
-                _ => RunStatus::Pending,
-            },
-            config_json: row.config_json,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            created_at: row.created_at,
-        }
+fn row_to_run(row: &SqliteRow) -> Run {
+    Run {
+        id: row.get("id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        status: match row.get::<String, _>("status").as_str() {
+            "running" => RunStatus::Running,
+            "paused" => RunStatus::Paused,
+            "completed" => RunStatus::Completed,
+            "failed" => RunStatus::Failed,
+            _ => RunStatus::Pending,
+        },
+        config_json: row.get("config_json"),
+        started_at: parse_datetime(row.get("started_at")),
+        completed_at: parse_datetime(row.get("completed_at")),
+        created_at: parse_datetime(row.get::<Option<String>, _>("created_at"))
+            .unwrap_or_else(Utc::now),
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct TaskRow {
-    id: String,
-    run_id: String,
-    description: String,
-    status: String,
-    wave: i32,
-    agent_session_id: Option<String>,
-    outputs_json: Option<String>,
-    result_json: Option<String>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    error: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<TaskRow> for Task {
-    fn from(row: TaskRow) -> Self {
-        Task {
-            id: row.id,
-            run_id: row.run_id,
-            description: row.description,
-            status: match row.status.as_str() {
-                "spawned" => TaskStatus::Spawned,
-                "executing" => TaskStatus::Executing,
-                "completed" => TaskStatus::Completed,
-                "failed" => TaskStatus::Failed,
-                _ => TaskStatus::Pending,
-            },
-            wave: row.wave as usize,
-            agent_session_id: row.agent_session_id,
-            outputs: row
-                .outputs_json
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default(),
-            result_json: row.result_json,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            error: row.error,
-            created_at: row.created_at,
-        }
+fn row_to_task(row: &SqliteRow) -> Task {
+    Task {
+        id: row.get("id"),
+        run_id: row.get("run_id"),
+        description: row.get("description"),
+        status: match row.get::<String, _>("status").as_str() {
+            "spawned" => TaskStatus::Spawned,
+            "executing" => TaskStatus::Executing,
+            "completed" => TaskStatus::Completed,
+            "failed" => TaskStatus::Failed,
+            _ => TaskStatus::Pending,
+        },
+        wave: row.get::<i32, _>("wave") as usize,
+        agent_session_id: row.get("agent_session_id"),
+        outputs: row
+            .get::<Option<String>, _>("outputs_json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        result_json: row.get("result_json"),
+        started_at: parse_datetime(row.get("started_at")),
+        completed_at: parse_datetime(row.get("completed_at")),
+        error: row.get("error"),
+        created_at: parse_datetime(row.get::<Option<String>, _>("created_at"))
+            .unwrap_or_else(Utc::now),
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct AgentLogRow {
-    id: i64,
-    run_id: String,
-    task_id: String,
-    level: String,
-    message: String,
-    created_at: chrono::DateTime<chrono::Utc>,
+fn row_to_agent_log(row: &SqliteRow) -> AgentLog {
+    AgentLog {
+        id: row.get("id"),
+        run_id: row.get("run_id"),
+        task_id: row.get("task_id"),
+        level: row.get("level"),
+        message: row.get("message"),
+        created_at: parse_datetime(row.get::<Option<String>, _>("created_at"))
+            .unwrap_or_else(Utc::now),
+    }
 }
 
-impl From<AgentLogRow> for AgentLog {
-    fn from(row: AgentLogRow) -> Self {
-        AgentLog {
-            id: row.id,
-            run_id: row.run_id,
-            task_id: row.task_id,
-            level: row.level,
-            message: row.message,
-            created_at: row.created_at,
-        }
-    }
+fn parse_datetime(s: Option<String>) -> Option<DateTime<Utc>> {
+    s.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    })
 }

@@ -22,7 +22,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.10"
 lazy_static = "1.5"
 petgraph = "0.6"  # For DAG operations
+tokio-stream = { version = "0.1", features = ["sync"] }
+open = "5.3"  # For opening browser
 
 # TUI (optional, for status --watch)
 ratatui = { version = "0.28", optional = true }
