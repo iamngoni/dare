@@ -1,0 +1,35 @@
+# dare.run configuration
+# See: https://github.com/iamngoni/dare
+
+[general]
+workspace = "."
+database = ".dare/dare.db"
+
+[execution]
+max_parallel_agents = 4
+wave_timeout_seconds = 300
+task_timeout_seconds = 120
+retry_failed_tasks = true
+max_retries = 2
+
+[gateway]
+host = "localhost"
+port = 18789
+
+[planning]
+auto_plan_model = "claude-sonnet-4-20250514"
+complexity_estimation = true
+
+[dashboard]
+enabled = true
+port = 8895
+open_browser = true
+
+[security]
+max_agents_per_run = 10
+max_concurrent_runs = 3
+max_run_duration_minutes = 60
+
+[logging]
+level = "info"
+file = ".dare/dare.log"

@@ -1,7 +1,7 @@
 //! OpenClaw Gateway WebSocket client
 //!
 //! Connects to the OpenClaw Gateway, handles Ed25519 authentication,
-//! spawns subagent sessions, and monitors session completion via WebSocket events.
+//! spawns agent sessions via cron API, and monitors session completion.
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -150,11 +150,12 @@ pub enum SessionState {
     Failed(String),
 }
 
-/// Information about a spawned session
+/// Information about a spawned session via cron job
 #[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub session_key: String,
+pub struct SpawnedTask {
     pub task_id: String,
+    pub cron_job_id: String,
+    pub session_key: Option<String>,
     pub state: SessionState,
 }
 
@@ -167,33 +168,43 @@ enum WsCommand {
 /// Gateway event received via WebSocket
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
-    /// Session state changed (agent event)
+    /// Cron job triggered (agent session spawned)
+    CronTriggered {
+        job_id: String,
+        session_key: String,
+    },
+    /// Session state changed
     SessionStateChanged {
         session_key: String,
         state: String,
-        error: Option<String>,
     },
-    /// Session completed successfully
-    SessionCompleted { session_key: String },
+    /// Session completed
+    SessionCompleted {
+        session_key: String,
+    },
     /// Session failed
     SessionFailed {
         session_key: String,
         error: String,
     },
-    /// Other event (for logging)
-    Other { event_type: String, payload: Value },
+    /// Connection established
+    Connected,
 }
 
 /// Pending requests waiting for response
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
 
-/// OpenClaw Gateway WebSocket client
+/// OpenClaw Gateway WebSocket client using cron-based spawning
 pub struct GatewayClient {
     config: GatewayConfig,
     command_tx: Arc<Mutex<Option<mpsc::Sender<WsCommand>>>>,
     pending: PendingMap,
     event_tx: mpsc::Sender<GatewayEvent>,
-    sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
+    /// Maps cron job ID -> task info
+    tasks: Arc<RwLock<HashMap<String, SpawnedTask>>>,
+    /// Maps session key -> cron job ID (for event correlation)
+    session_to_job: Arc<RwLock<HashMap<String, String>>>,
+    connected: Arc<RwLock<bool>>,
 }
 
 impl GatewayClient {
@@ -207,7 +218,9 @@ impl GatewayClient {
             command_tx: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            session_to_job: Arc::new(RwLock::new(HashMap::new())),
+            connected: Arc::new(RwLock::new(false)),
         });
 
         // Start connection in background
@@ -218,8 +231,17 @@ impl GatewayClient {
             }
         });
 
-        // Wait for connection to establish
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for connection with timeout
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if *client.connected.read().await {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(anyhow!("Timeout waiting for gateway connection"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         Ok(client)
     }
@@ -250,6 +272,7 @@ impl GatewayClient {
         let _ = cmd_tx.send(WsCommand::Shutdown).await;
         let _ = writer_handle.await;
         *self.command_tx.lock().await = None;
+        *self.connected.write().await = false;
 
         result
     }
@@ -310,6 +333,9 @@ impl GatewayClient {
 
         self.handle_connect_response(connect_res)?;
         info!("Gateway authenticated successfully!");
+        
+        *self.connected.write().await = true;
+        let _ = self.event_tx.send(GatewayEvent::Connected).await;
 
         // Main message loop
         while let Some(msg_result) = read.next().await {
@@ -359,7 +385,7 @@ impl GatewayClient {
     /// Build the connect request with device signature
     fn build_connect_request(&self, nonce: &str) -> Result<String> {
         let signed_at = chrono::Utc::now().timestamp_millis();
-        let client_id = "cli";
+        let client_id = "cli";  // Must match gateway-allowed client IDs
         let client_mode = "cli";
         let role = "operator";
         let scopes = "operator.admin";
@@ -468,76 +494,135 @@ impl GatewayClient {
             return Ok(());
         }
 
-        debug!("Gateway event: {} {:?}", event_name, payload);
+        // Log all events for debugging
+        info!("Gateway event: {} payload_keys={:?}", event_name, 
+            payload.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
 
-        // Process agent events for session monitoring
-        if event_name == "agent" {
-            let session_key = payload
-                .get("sessionKey")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let state = payload
-                .get("state")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            // Check if this is one of our sessions
-            let is_ours = {
-                let sessions = self.sessions.read().await;
-                sessions.contains_key(&session_key)
-            };
-
-            if is_ours || session_key.contains("dare-") {
-                // Update session state
-                if state == "completed" || state == "done" {
-                    let _ = self
-                        .event_tx
-                        .send(GatewayEvent::SessionCompleted {
-                            session_key: session_key.clone(),
-                        })
-                        .await;
-
-                    // Update local tracking
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(info) = sessions.get_mut(&session_key) {
-                        info.state = SessionState::Completed;
+        match event_name {
+            "cron" => {
+                // Cron job events
+                let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                let job_id = payload.get("jobId").and_then(|j| j.as_str()).unwrap_or("");
+                info!("Cron event: action={} jobId={}", action, job_id);
+                
+                // Extract session key if present
+                let session_key = payload.get("sessionKey").and_then(|s| s.as_str()).unwrap_or("");
+                
+                match action {
+                    "triggered" | "executed" | "fired" | "started" => {
+                        if !session_key.is_empty() {
+                            // Map session to job
+                            {
+                                let mut s2j = self.session_to_job.write().await;
+                                s2j.insert(session_key.to_string(), job_id.to_string());
+                            }
+                            
+                            // Update task state
+                            {
+                                let mut tasks = self.tasks.write().await;
+                                if let Some(task) = tasks.get_mut(job_id) {
+                                    task.session_key = Some(session_key.to_string());
+                                    task.state = SessionState::Running;
+                                }
+                            }
+                            
+                            let _ = self.event_tx.send(GatewayEvent::CronTriggered {
+                                job_id: job_id.to_string(),
+                                session_key: session_key.to_string(),
+                            }).await;
+                        }
                     }
-                } else if state == "failed" || state == "error" {
-                    let error = payload
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("Unknown error")
-                        .to_string();
-                    let _ = self
-                        .event_tx
-                        .send(GatewayEvent::SessionFailed {
-                            session_key: session_key.clone(),
-                            error: error.clone(),
-                        })
-                        .await;
-
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(info) = sessions.get_mut(&session_key) {
-                        info.state = SessionState::Failed(error);
+                    "finished" | "completed" => {
+                        // Cron job finished - check status
+                        let status = payload.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                        info!("Cron job finished: jobId={} status={} sessionKey={}", job_id, status, session_key);
+                        
+                        // Update task state
+                        {
+                            let mut tasks = self.tasks.write().await;
+                            if let Some(task) = tasks.get_mut(job_id) {
+                                if status == "success" || status == "ok" || status.is_empty() {
+                                    task.state = SessionState::Completed;
+                                } else {
+                                    task.state = SessionState::Failed(status.to_string());
+                                }
+                            }
+                        }
+                        
+                        // Send completion event
+                        if status == "success" || status == "ok" || status.is_empty() {
+                            let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
+                                session_key: session_key.to_string(),
+                            }).await;
+                        } else {
+                            let _ = self.event_tx.send(GatewayEvent::SessionFailed {
+                                session_key: session_key.to_string(),
+                                error: status.to_string(),
+                            }).await;
+                        }
                     }
-                } else {
-                    let _ = self
-                        .event_tx
-                        .send(GatewayEvent::SessionStateChanged {
-                            session_key: session_key.clone(),
-                            state: state.clone(),
-                            error: None,
-                        })
-                        .await;
-
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(info) = sessions.get_mut(&session_key) {
-                        info.state = SessionState::Running;
+                    _ => {}
+                }
+            }
+            "agent" => {
+                // Agent session state changes
+                let session_key = payload.get("sessionKey").and_then(|s| s.as_str()).unwrap_or("");
+                let state = payload.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
+                
+                // Check if this is one of our sessions
+                let job_id = {
+                    let s2j = self.session_to_job.read().await;
+                    s2j.get(session_key).cloned()
+                };
+                
+                // Also check if session key contains "dare-" prefix (our spawned sessions)
+                let is_ours = job_id.is_some() || session_key.contains("dare-");
+                
+                if is_ours {
+                    debug!("Agent event for our session: {} state={}", session_key, state);
+                    
+                    match state {
+                        "completed" | "done" | "idle" => {
+                            // Update task state
+                            if let Some(ref jid) = job_id {
+                                let mut tasks = self.tasks.write().await;
+                                if let Some(task) = tasks.get_mut(jid) {
+                                    task.state = SessionState::Completed;
+                                }
+                            }
+                            
+                            let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
+                                session_key: session_key.to_string(),
+                            }).await;
+                        }
+                        "failed" | "error" => {
+                            let error = payload.get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("Unknown error")
+                                .to_string();
+                            
+                            if let Some(ref jid) = job_id {
+                                let mut tasks = self.tasks.write().await;
+                                if let Some(task) = tasks.get_mut(jid) {
+                                    task.state = SessionState::Failed(error.clone());
+                                }
+                            }
+                            
+                            let _ = self.event_tx.send(GatewayEvent::SessionFailed {
+                                session_key: session_key.to_string(),
+                                error,
+                            }).await;
+                        }
+                        _ => {
+                            let _ = self.event_tx.send(GatewayEvent::SessionStateChanged {
+                                session_key: session_key.to_string(),
+                                state: state.to_string(),
+                            }).await;
+                        }
                     }
                 }
             }
+            _ => {}
         }
 
         Ok(())
@@ -608,76 +693,231 @@ impl GatewayClient {
     }
 
     // ========================================================================
-    // Public API
+    // Public API - Cron-based task spawning
     // ========================================================================
 
-    /// Spawn a subagent session for a task
-    pub async fn spawn_session(&self, task_id: &str, label: &str, message: &str) -> Result<String> {
-        info!(task_id = %task_id, label = %label, "Spawning subagent session");
+    /// Spawn an agent session for a task
+    /// 
+    /// Strategy:
+    /// 1. Try subagents.spawn first (preferred, direct approach)
+    /// 2. Fall back to cron-based spawning if needed
+    pub async fn spawn_task(&self, task_id: &str, label: &str, message: &str) -> Result<String> {
+        info!(task_id = %task_id, label = %label, "Spawning agent task");
 
-        let response = self
-            .request(
-                "sessions.spawn",
-                json!({
-                    "label": label,
-                    "message": message,
-                    "model": null  // Use default model
-                }),
-            )
-            .await?;
+        // Try direct subagent spawn first
+        let subagent_result = self.request("subagents.spawn", json!({
+            "label": label,
+            "message": message
+        })).await;
 
-        let session_key = response
-            .get("sessionKey")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow!("No sessionKey in spawn response"))?
-            .to_string();
+        if let Ok(payload) = subagent_result {
+            let session_key = payload
+                .get("sessionKey")
+                .or_else(|| payload.get("session"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("subagent:{}", task_id));
 
-        // Track this session
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.insert(
-                session_key.clone(),
-                SessionInfo {
-                    session_key: session_key.clone(),
-                    task_id: task_id.to_string(),
-                    state: SessionState::Spawning,
-                },
-            );
+            // Track this session
+            {
+                let mut s2j = self.session_to_job.write().await;
+                s2j.insert(session_key.clone(), task_id.to_string());
+            }
+
+            info!(session_key = %session_key, task_id = %task_id, "Subagent spawned directly");
+            return Ok(session_key);
         }
 
-        info!(session_key = %session_key, task_id = %task_id, "Session spawned");
-        Ok(session_key)
+        // Fall back to cron-based approach
+        info!(task_id = %task_id, "Subagent spawn failed, falling back to cron");
+
+        // Create unique job ID
+        let job_id = format!("dare-{}-{}", task_id, uuid::Uuid::new_v4().simple());
+
+        // Create the cron job with agentTurn payload
+        // Using a one-shot schedule that triggers far in the future (we'll trigger manually)
+        let add_result = self.request("cron.add", json!({
+            "name": job_id,
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 0 1 1 *"  // Jan 1st at midnight - never naturally triggers
+            },
+            "enabled": true,
+            "sessionTarget": "isolated",
+            "payload": {
+                "kind": "agentTurn",
+                "message": message
+            }
+        })).await;
+
+        match add_result {
+            Ok(payload) => {
+                debug!("Cron job created: {:?}", payload);
+                
+                // Extract the actual job ID from the response (may differ from name)
+                let actual_job_id = payload.get("jobId")
+                    .or_else(|| payload.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| job_id.clone());
+                
+                info!(job_id = %actual_job_id, name = %job_id, "Cron job created");
+                
+                // Track the task
+                {
+                    let mut tasks = self.tasks.write().await;
+                    tasks.insert(actual_job_id.clone(), SpawnedTask {
+                        task_id: task_id.to_string(),
+                        cron_job_id: actual_job_id.clone(),
+                        session_key: None,
+                        state: SessionState::Spawning,
+                    });
+                }
+
+                // Trigger the job immediately
+                let run_result = self.request("cron.run", json!({
+                    "jobId": actual_job_id
+                })).await;
+
+                match run_result {
+                    Ok(run_payload) => {
+                        debug!("Cron job triggered: {:?}", run_payload);
+                        
+                        // Extract session key if provided in response
+                        if let Some(session_key) = run_payload.get("sessionKey").and_then(|s| s.as_str()) {
+                            let mut tasks = self.tasks.write().await;
+                            if let Some(task) = tasks.get_mut(&actual_job_id) {
+                                task.session_key = Some(session_key.to_string());
+                                task.state = SessionState::Running;
+                            }
+                            
+                            let mut s2j = self.session_to_job.write().await;
+                            s2j.insert(session_key.to_string(), actual_job_id.clone());
+                        }
+                        
+                        Ok(actual_job_id)
+                    }
+                    Err(e) => {
+                        // Clean up the cron job
+                        let _ = self.remove_job(&actual_job_id).await;
+                        Err(anyhow!("Failed to trigger cron job: {}", e))
+                    }
+                }
+            }
+            Err(e) => {
+                Err(anyhow!("Failed to create cron job: {}", e))
+            }
+        }
     }
 
-    /// Get the current state of a session
-    pub async fn get_session_state(&self, session_key: &str) -> Option<SessionState> {
-        let sessions = self.sessions.read().await;
-        sessions.get(session_key).map(|s| s.state.clone())
+    /// Remove a cron job (cleanup after task completion)
+    pub async fn remove_job(&self, job_id: &str) -> Result<()> {
+        debug!(job_id = %job_id, "Removing cron job");
+        
+        self.request("cron.remove", json!({
+            "jobId": job_id
+        })).await?;
+        
+        // Clean up tracking
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.remove(job_id);
+        }
+        
+        Ok(())
+    }
+
+    /// Get the current state of a task
+    pub async fn get_task_state(&self, job_id: &str) -> Option<SessionState> {
+        let tasks = self.tasks.read().await;
+        tasks.get(job_id).map(|t| t.state.clone())
+    }
+
+    /// Get task info by job ID
+    pub async fn get_task(&self, job_id: &str) -> Option<SpawnedTask> {
+        let tasks = self.tasks.read().await;
+        tasks.get(job_id).cloned()
+    }
+
+    /// Find task by session key
+    pub async fn find_task_by_session(&self, session_key: &str) -> Option<SpawnedTask> {
+        let s2j = self.session_to_job.read().await;
+        if let Some(job_id) = s2j.get(session_key) {
+            let tasks = self.tasks.read().await;
+            return tasks.get(job_id).cloned();
+        }
+        None
+    }
+
+    /// List active sessions
+    pub async fn list_sessions(&self) -> Result<Value> {
+        self.request("sessions.list", json!({})).await
     }
 
     /// Kill a session
     pub async fn kill_session(&self, session_key: &str) -> Result<()> {
         info!(session_key = %session_key, "Killing session");
-
+        
         self.request("sessions.kill", json!({ "sessionKey": session_key }))
             .await?;
-
-        // Remove from tracking
-        let mut sessions = self.sessions.write().await;
-        sessions.remove(session_key);
-
+        
+        // Clean up tracking if this was one of our sessions
+        let job_id = {
+            let s2j = self.session_to_job.read().await;
+            s2j.get(session_key).cloned()
+        };
+        
+        if let Some(job_id) = job_id {
+            let mut tasks = self.tasks.write().await;
+            tasks.remove(&job_id);
+            
+            let mut s2j = self.session_to_job.write().await;
+            s2j.remove(session_key);
+        }
+        
         Ok(())
     }
 
-    /// List active sessions
-    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        let sessions = self.sessions.read().await;
-        Ok(sessions.values().cloned().collect())
+    /// Spawn a session directly 
+    /// Uses subagents.spawn to create an isolated agent session
+    pub async fn spawn_session(&self, task_id: &str, label: &str, message: &str) -> Result<String> {
+        info!(task_id = %task_id, label = %label, "Spawning subagent session");
+
+        // Try subagents.spawn - this spawns an isolated subagent
+        let result = self.request("subagents.spawn", json!({
+            "label": label,
+            "message": message
+        })).await;
+
+        match result {
+            Ok(payload) => {
+                // The response may have sessionKey or just confirm the spawn
+                let session_key = payload
+                    .get("sessionKey")
+                    .or_else(|| payload.get("session"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("subagent:{}", task_id));
+
+                // Track this session
+                {
+                    let mut s2j = self.session_to_job.write().await;
+                    s2j.insert(session_key.clone(), task_id.to_string());
+                }
+
+                info!(session_key = %session_key, task_id = %task_id, "Subagent session spawned");
+                Ok(session_key)
+            }
+            Err(e) => {
+                // If subagents.spawn doesn't work, we're stuck
+                Err(anyhow!("Failed to spawn session: {}", e))
+            }
+        }
     }
 
     /// Check if connected to gateway
     pub async fn is_connected(&self) -> bool {
-        self.command_tx.lock().await.is_some()
+        *self.connected.read().await
     }
 }
 
@@ -690,7 +930,6 @@ mod tests {
         // This test just ensures the config loading doesn't panic
         // In CI without OpenClaw setup, this will return an error
         let result = GatewayConfig::load();
-        // We don't assert Ok because CI won't have OpenClaw set up
         println!("Config load result: {:?}", result.is_ok());
     }
 }

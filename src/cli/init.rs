@@ -41,7 +41,7 @@ complexity_estimation = true
 
 [dashboard]
 enabled = true
-port = 8765
+port = 8895
 open_browser = true
 
 [security]

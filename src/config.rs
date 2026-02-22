@@ -106,7 +106,7 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            port: 8765,
+            port: 8895,
             open_browser: true,
         }
     }

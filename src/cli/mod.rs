@@ -160,7 +160,7 @@ pub struct KillArgs {
 #[derive(Parser)]
 pub struct DashboardArgs {
     /// Port to run dashboard on
-    #[arg(short, long, default_value = "8765")]
+    #[arg(short, long, default_value = "8895")]
     pub port: u16,
 
     /// Don't open browser automatically
