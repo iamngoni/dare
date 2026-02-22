@@ -1,225 +1,164 @@
-//! Message bus for inter-agent communication
+//! Result bus for inter-task communication
+//!
+//! This module handles passing results between tasks when one depends on another.
+//! Note: This is purely internal orchestration - agents don't need to know about this.
+//! The executor observes session completion via the gateway.
 
-use lazy_static::lazy_static;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 use crate::models::TaskId;
 
-/// A message on the bus
+/// A message about task lifecycle (internal to orchestrator)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BusMessage {
-    // Status updates
-    Progress {
+pub enum TaskMessage {
+    /// Task was spawned
+    Spawned {
         task_id: TaskId,
-        percent: u8,
-        detail: String,
+        session_key: String,
     },
+    /// Task is now running (session is active)
+    Running {
+        task_id: TaskId,
+    },
+    /// Task completed successfully
     Completed {
         task_id: TaskId,
+        summary: String,
     },
+    /// Task failed
     Failed {
         task_id: TaskId,
         error: String,
     },
-
-    // Coordination
-    HelpRequest {
-        from: TaskId,
-        question: String,
-    },
-    HelpResponse {
-        to: TaskId,
-        answer: String,
-    },
-
-    // File operations
-    FileLockRequest {
-        task_id: TaskId,
-        path: PathBuf,
-    },
-    FileLockGranted {
-        task_id: TaskId,
-        path: PathBuf,
-    },
-    FileLockDenied {
-        task_id: TaskId,
-        path: PathBuf,
-        held_by: TaskId,
-    },
-    FileReleased {
-        task_id: TaskId,
-        path: PathBuf,
-    },
-
-    // System
-    Broadcast {
-        message: String,
-    },
-    AgentLog {
-        task_id: TaskId,
-        level: String,
-        message: String,
-    },
 }
 
-impl BusMessage {
-    /// Get the target task ID if this message is directed
-    pub fn target(&self) -> Option<&TaskId> {
+impl TaskMessage {
+    /// Get the task ID from the message
+    pub fn task_id(&self) -> &TaskId {
         match self {
-            BusMessage::HelpResponse { to, .. } => Some(to),
-            BusMessage::FileLockGranted { task_id, .. } => Some(task_id),
-            BusMessage::FileLockDenied { task_id, .. } => Some(task_id),
-            _ => None,
-        }
-    }
-
-    /// Get the source task ID
-    pub fn source(&self) -> Option<&TaskId> {
-        match self {
-            BusMessage::Progress { task_id, .. } => Some(task_id),
-            BusMessage::Completed { task_id } => Some(task_id),
-            BusMessage::Failed { task_id, .. } => Some(task_id),
-            BusMessage::HelpRequest { from, .. } => Some(from),
-            BusMessage::FileLockRequest { task_id, .. } => Some(task_id),
-            BusMessage::FileReleased { task_id, .. } => Some(task_id),
-            BusMessage::AgentLog { task_id, .. } => Some(task_id),
-            _ => None,
+            TaskMessage::Spawned { task_id, .. } => task_id,
+            TaskMessage::Running { task_id } => task_id,
+            TaskMessage::Completed { task_id, .. } => task_id,
+            TaskMessage::Failed { task_id, .. } => task_id,
         }
     }
 }
 
-/// The message bus for coordinating agents
-pub struct MessageBus {
-    /// Sender for new messages
-    tx: mpsc::Sender<BusMessage>,
-
-    /// Broadcast channel for subscribers
-    broadcast_tx: broadcast::Sender<BusMessage>,
-
-    /// Direct channels to specific tasks
-    subscribers: Arc<RwLock<HashMap<TaskId, mpsc::Sender<BusMessage>>>>,
+/// Result from a completed task (for dependent tasks)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub task_id: TaskId,
+    pub files_modified: Vec<String>,
+    pub summary: String,
 }
 
-impl MessageBus {
-    /// Create a new message bus
-    pub fn new(tx: mpsc::Sender<BusMessage>) -> Self {
+/// Bus for task-to-task result passing
+/// 
+/// This is used by the executor to:
+/// 1. Store results when tasks complete
+/// 2. Provide context to dependent tasks
+pub struct TaskBus {
+    /// Results from completed tasks
+    results: Arc<RwLock<HashMap<TaskId, TaskResult>>>,
+    
+    /// Broadcast channel for task lifecycle events
+    broadcast_tx: broadcast::Sender<TaskMessage>,
+}
+
+impl TaskBus {
+    /// Create a new task bus
+    pub fn new() -> Self {
         let (broadcast_tx, _) = broadcast::channel(100);
-
+        
         Self {
-            tx,
+            results: Arc::new(RwLock::new(HashMap::new())),
             broadcast_tx,
-            subscribers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Publish a message to the bus
-    pub async fn publish(&self, msg: BusMessage) {
-        // Send to main channel
-        let _ = self.tx.send(msg.clone()).await;
+    /// Store a result for a completed task
+    pub async fn store_result(&self, result: TaskResult) {
+        let task_id = result.task_id.clone();
+        let summary = result.summary.clone();
+        
+        self.results.write().await.insert(task_id.clone(), result);
+        
+        // Broadcast completion
+        let _ = self.broadcast_tx.send(TaskMessage::Completed {
+            task_id,
+            summary,
+        });
+    }
 
-        // Broadcast to all subscribers
-        let _ = self.broadcast_tx.send(msg.clone());
+    /// Get result for a specific task
+    pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
+        self.results.read().await.get(task_id).cloned()
+    }
 
-        // Direct delivery if addressed
-        if let Some(target) = msg.target() {
-            let subscribers = self.subscribers.read().await;
-            if let Some(tx) = subscribers.get(target) {
-                let _ = tx.send(msg).await;
+    /// Get all results for a set of task IDs (for dependency context)
+    pub async fn get_dependency_results(&self, task_ids: &[TaskId]) -> Vec<TaskResult> {
+        let results = self.results.read().await;
+        task_ids
+            .iter()
+            .filter_map(|id| results.get(id).cloned())
+            .collect()
+    }
+
+    /// Build context string from dependency results
+    pub async fn build_context(&self, depends_on: &[TaskId]) -> String {
+        let results = self.get_dependency_results(depends_on).await;
+        
+        if results.is_empty() {
+            return String::new();
+        }
+
+        let mut context = String::from("## Context from Completed Dependencies\n\n");
+        
+        for result in results {
+            context.push_str(&format!(
+                "### Task: {}\n{}\n",
+                result.task_id, result.summary
+            ));
+            
+            if !result.files_modified.is_empty() {
+                context.push_str("Files modified:\n");
+                for file in &result.files_modified {
+                    context.push_str(&format!("- {}\n", file));
+                }
             }
+            context.push('\n');
         }
+
+        context
     }
 
-    /// Subscribe to messages for a specific task
-    pub async fn subscribe(&self, task_id: TaskId) -> mpsc::Receiver<BusMessage> {
-        let (tx, rx) = mpsc::channel(100);
-        self.subscribers.write().await.insert(task_id, tx);
-        rx
-    }
-
-    /// Subscribe to all broadcast messages
-    pub fn subscribe_broadcast(&self) -> broadcast::Receiver<BusMessage> {
+    /// Subscribe to task lifecycle events
+    pub fn subscribe(&self) -> broadcast::Receiver<TaskMessage> {
         self.broadcast_tx.subscribe()
     }
 
-    /// Unsubscribe a task
-    pub async fn unsubscribe(&self, task_id: &TaskId) {
-        self.subscribers.write().await.remove(task_id);
+    /// Publish a task lifecycle event
+    pub fn publish(&self, msg: TaskMessage) {
+        let _ = self.broadcast_tx.send(msg);
+    }
+
+    /// Get all stored results
+    pub async fn all_results(&self) -> HashMap<TaskId, TaskResult> {
+        self.results.read().await.clone()
+    }
+
+    /// Clear all results (for new runs)
+    pub async fn clear(&self) {
+        self.results.write().await.clear();
     }
 }
 
-/// Parser for DARE protocol markers in agent output
-pub struct MarkerParser;
-
-lazy_static! {
-    static ref PROGRESS_RE: Regex =
-        Regex::new(r"\[DARE:PROGRESS:(\d+)\]\s*(.*)").unwrap();
-    static ref COMPLETE_RE: Regex =
-        Regex::new(r"\[DARE:COMPLETE\]").unwrap();
-    static ref FAILED_RE: Regex =
-        Regex::new(r"\[DARE:FAILED\]\s*(.*)").unwrap();
-    static ref HELP_RE: Regex =
-        Regex::new(r"\[DARE:HELP\]\s*(.*)").unwrap();
-    static ref LOG_RE: Regex =
-        Regex::new(r"\[DARE:LOG:(\w+)\]\s*(.*)").unwrap();
-    static ref LOCK_RE: Regex =
-        Regex::new(r"\[DARE:LOCK:([^\]]+)\]").unwrap();
-    static ref UNLOCK_RE: Regex =
-        Regex::new(r"\[DARE:UNLOCK:([^\]]+)\]").unwrap();
-}
-
-impl MarkerParser {
-    /// Parse agent output for DARE protocol markers
-    pub fn parse(task_id: &TaskId, output: &str) -> Vec<BusMessage> {
-        let mut messages = Vec::new();
-
-        for line in output.lines() {
-            if let Some(caps) = PROGRESS_RE.captures(line) {
-                if let Ok(percent) = caps[1].parse() {
-                    messages.push(BusMessage::Progress {
-                        task_id: task_id.clone(),
-                        percent,
-                        detail: caps[2].to_string(),
-                    });
-                }
-            } else if COMPLETE_RE.is_match(line) {
-                messages.push(BusMessage::Completed {
-                    task_id: task_id.clone(),
-                });
-            } else if let Some(caps) = FAILED_RE.captures(line) {
-                messages.push(BusMessage::Failed {
-                    task_id: task_id.clone(),
-                    error: caps[1].to_string(),
-                });
-            } else if let Some(caps) = HELP_RE.captures(line) {
-                messages.push(BusMessage::HelpRequest {
-                    from: task_id.clone(),
-                    question: caps[1].to_string(),
-                });
-            } else if let Some(caps) = LOG_RE.captures(line) {
-                messages.push(BusMessage::AgentLog {
-                    task_id: task_id.clone(),
-                    level: caps[1].to_string(),
-                    message: caps[2].to_string(),
-                });
-            } else if let Some(caps) = LOCK_RE.captures(line) {
-                messages.push(BusMessage::FileLockRequest {
-                    task_id: task_id.clone(),
-                    path: PathBuf::from(&caps[1]),
-                });
-            } else if let Some(caps) = UNLOCK_RE.captures(line) {
-                messages.push(BusMessage::FileReleased {
-                    task_id: task_id.clone(),
-                    path: PathBuf::from(&caps[1]),
-                });
-            }
-        }
-
-        messages
+impl Default for TaskBus {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -227,38 +166,58 @@ impl MarkerParser {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_progress() {
-        let output = "[DARE:PROGRESS:50] Halfway done";
-        let messages = MarkerParser::parse(&"test".to_string(), output);
-        assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            BusMessage::Progress { percent, detail, .. } => {
-                assert_eq!(*percent, 50);
-                assert_eq!(detail, "Halfway done");
-            }
-            _ => panic!("Expected Progress message"),
-        }
+    #[tokio::test]
+    async fn test_store_and_get_result() {
+        let bus = TaskBus::new();
+        
+        let result = TaskResult {
+            task_id: "task1".to_string(),
+            files_modified: vec!["src/main.rs".to_string()],
+            summary: "Implemented main function".to_string(),
+        };
+        
+        bus.store_result(result.clone()).await;
+        
+        let retrieved = bus.get_result(&"task1".to_string()).await;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().summary, "Implemented main function");
     }
 
-    #[test]
-    fn test_parse_complete() {
-        let output = "[DARE:COMPLETE]";
-        let messages = MarkerParser::parse(&"test".to_string(), output);
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(messages[0], BusMessage::Completed { .. }));
+    #[tokio::test]
+    async fn test_build_context() {
+        let bus = TaskBus::new();
+        
+        bus.store_result(TaskResult {
+            task_id: "migration".to_string(),
+            files_modified: vec!["migrations/001.sql".to_string()],
+            summary: "Created users table".to_string(),
+        }).await;
+        
+        bus.store_result(TaskResult {
+            task_id: "model".to_string(),
+            files_modified: vec!["src/models/user.rs".to_string()],
+            summary: "Implemented User model".to_string(),
+        }).await;
+        
+        let context = bus.build_context(&["migration".to_string(), "model".to_string()]).await;
+        
+        assert!(context.contains("migration"));
+        assert!(context.contains("model"));
+        assert!(context.contains("Created users table"));
+        assert!(context.contains("User model"));
     }
 
-    #[test]
-    fn test_parse_failed() {
-        let output = "[DARE:FAILED] Something went wrong";
-        let messages = MarkerParser::parse(&"test".to_string(), output);
-        assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            BusMessage::Failed { error, .. } => {
-                assert_eq!(error, "Something went wrong");
-            }
-            _ => panic!("Expected Failed message"),
-        }
+    #[tokio::test]
+    async fn test_subscription() {
+        let bus = TaskBus::new();
+        let mut rx = bus.subscribe();
+        
+        bus.publish(TaskMessage::Spawned {
+            task_id: "task1".to_string(),
+            session_key: "session-123".to_string(),
+        });
+        
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.task_id(), "task1");
     }
 }

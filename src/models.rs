@@ -128,51 +128,6 @@ pub enum Complexity {
     ExtraLarge,
 }
 
-/// A message on the bus
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BusMessage {
-    pub id: i64,
-    pub run_id: RunId,
-    pub task_id: Option<TaskId>,
-    pub message_type: MessageType,
-    pub payload: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageType {
-    Progress,
-    Completed,
-    Failed,
-    HelpRequest,
-    HelpResponse,
-    FileLockRequest,
-    FileLockGranted,
-    FileLockDenied,
-    FileReleased,
-    Broadcast,
-    AgentLog,
-}
-
-/// A file lock
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileLock {
-    pub path: PathBuf,
-    pub run_id: RunId,
-    pub task_id: TaskId,
-    pub lock_type: LockType,
-    pub acquired_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LockType {
-    Exclusive,
-    Shared,
-}
-
 /// Agent log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLog {
@@ -182,12 +137,4 @@ pub struct AgentLog {
     pub level: String,
     pub message: String,
     pub created_at: DateTime<Utc>,
-}
-
-/// Progress update from an agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgressUpdate {
-    pub task_id: TaskId,
-    pub percent: u8,
-    pub detail: String,
 }

@@ -35,6 +35,10 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
+# Crypto (for gateway auth)
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
 # Utilities
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

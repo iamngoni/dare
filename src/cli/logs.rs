@@ -9,7 +9,8 @@ use super::LogsArgs;
 
 /// View logs for a run
 pub async fn run(args: LogsArgs, config: &Config) -> Result<()> {
-    let db = Database::connect(&config.general.database).await?;
+    let db = Database::connect(&config.database_path()).await?;
+    db.migrate().await?;
 
     // Get run (specified or most recent)
     let run = if let Some(ref run_id) = args.run_id {
