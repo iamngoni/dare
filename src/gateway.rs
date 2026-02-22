@@ -359,8 +359,8 @@ impl GatewayClient {
     /// Build the connect request with device signature
     fn build_connect_request(&self, nonce: &str) -> Result<String> {
         let signed_at = chrono::Utc::now().timestamp_millis();
-        let client_id = "gateway-client";
-        let client_mode = "daemon";
+        let client_id = "cli";
+        let client_mode = "cli";
         let role = "operator";
         let scopes = "operator.admin";
 
@@ -394,7 +394,7 @@ impl GatewayClient {
                     "version": env!("CARGO_PKG_VERSION"),
                     "platform": std::env::consts::OS,
                     "mode": client_mode,
-                    "displayName": "dare.run orchestrator"
+                    "displayName": "dare.run"
                 },
                 "auth": {
                     "token": self.config.auth_token,
