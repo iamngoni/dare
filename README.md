@@ -15,10 +15,21 @@ dare.run transforms complex tasks into coordinated agent swarms. Instead of one 
 
 1. **Decomposes** your PRD/task into a dependency graph (DAG)
 2. **Parallelizes** independent work across multiple agents
-3. **Coordinates** agents through a shared message bus
-4. **Visualizes** progress in real-time via TUI and web dashboard
+3. **Observes** agent progress passively via OpenClaw gateway
+4. **Visualizes** progress in real-time via web dashboard
 
 Think of it as `make` for AI agents — but smarter.
+
+## Key Design: Passive Observation
+
+**Agents work naturally — dare observes passively.**
+
+Unlike traditional orchestration that requires agents to emit special markers or follow protocols, dare uses **passive observation** through the OpenClaw gateway:
+
+- **Session lifecycle = task lifecycle** — When a session completes, the task is done
+- **Gateway events** — We monitor WebSocket events for state changes
+- **File scope tracking** — Orchestrator prevents concurrent file conflicts
+- **Natural agent behavior** — No special output format or protocol needed
 
 ## Why?
 
@@ -34,8 +45,6 @@ Parallel with dare (3 min):
   Wave 2: routes + middleware┤ (parallel!)
   Wave 3: tests ─────────────┘
 ```
-
-Agents coordinate through a shared message bus, requesting file locks, sharing intermediate results, and asking siblings for help when stuck.
 
 ## Installation
 
@@ -80,13 +89,44 @@ tasks:
     outputs: [src/routes/auth.rs]
 ```
 
-### 3. Run it
+### 3. Preview the plan
+
+```bash
+dare plan dare.yaml
+```
+
+```
+dare.run v0.1.0 — Execution Plan
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 Plan: Add user authentication
+📊 Summary: 3 tasks • 3 waves
+
+Wave 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ○ migration 
+    Create users table
+    → files: migrations/001_users.sql
+
+Wave 2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ○ user_model 
+    User model with password hashing
+    ↳ depends on: migration
+    → files: src/models/user.rs
+
+Wave 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ○ auth_routes 
+    Login/logout endpoints
+    ↳ depends on: user_model
+    → files: src/routes/auth.rs
+```
+
+### 4. Run it
 
 ```bash
 dare run dare.yaml
 ```
 
-### 4. Or let AI do the planning
+### 5. Or let AI do the planning
 
 ```bash
 dare run --auto "Add user authentication with JWT, login, logout, and protected routes"
@@ -97,28 +137,24 @@ dare run --auto "Add user authentication with JWT, login, logout, and protected 
 ### 🎯 DAG-based Execution
 Tasks are organized into waves. Independent tasks run in parallel; dependent tasks wait.
 
-### 💬 Message Bus
-Agents communicate through a shared channel:
-- Progress updates
-- Help requests
-- Result sharing
-- File lock coordination
+### 📡 Passive Observation
+Monitor agent sessions via OpenClaw gateway WebSocket — no special agent protocol needed.
 
-### 🔒 File Locking
-Prevents conflicts when multiple agents need the same file. Automatic deadlock prevention with timeouts.
+### 🔒 File Scope Tracking
+Prevents conflicts by tracking which files each task owns. No concurrent access to the same files.
 
 ### 📊 Real-time Dashboard
-Web-based visualization of:
+Web-based visualization with HTMX + SSE:
 - DAG with live status
-- Per-agent progress bars
-- Message bus activity
-- Logs streaming
+- Task progress
+- Live event stream
+- Pause/resume/kill controls
 
 ### ⚡ OpenClaw Integration
 Built on OpenClaw's agent infrastructure:
-- Session spawning
-- Message passing
-- Resource management
+- Ed25519 device authentication
+- WebSocket session monitoring
+- Subagent spawning
 
 ## CLI Reference
 
@@ -132,36 +168,52 @@ dare run --continue <run-id>   # Resume interrupted run
 dare plan <file.yaml>          # Preview execution plan
 dare plan --auto "..."         # Generate plan from description
 dare plan --validate           # Check for cycles/errors
+dare plan --format yaml        # Output as YAML
 
 # Monitoring
 dare status                    # Current run status
-dare status --watch            # Live TUI
+dare status <run-id>           # Specific run
 dare logs                      # View logs
 dare logs --follow             # Stream logs
+dare logs --task <id>          # Filter by task
 
 # Control
 dare pause                     # Pause after current wave
 dare resume                    # Resume paused run
-dare kill                      # Abort everything
+dare kill                      # Abort all agents
+dare kill --task <id>          # Kill specific task
 
 # Dashboard
-dare dashboard                 # Open web UI
+dare dashboard                 # Open web UI (default: port 8765)
+
+# Setup
+dare init                      # Create dare.toml
+dare config                    # Show configuration
 ```
 
 ## Configuration
 
 ```toml
 # dare.toml
+[general]
+workspace = "."
+database = ".dare/dare.db"
+
 [execution]
 max_parallel_agents = 4
 wave_timeout_seconds = 300
 task_timeout_seconds = 120
 
 [gateway]
+host = "localhost"
 port = 18789
+
+[planning]
+model = "claude-sonnet-4-20250514"
 
 [dashboard]
 port = 8765
+open_browser = true
 ```
 
 ## Architecture
@@ -169,13 +221,17 @@ port = 8765
 ```
 ┌──────────────────────────────────────────────────┐
 │                   dare CLI                        │
+│  run | plan | status | logs | dashboard          │
 └──────────────────────────────────────────────────┘
                         │
                         ▼
 ┌──────────────────────────────────────────────────┐
 │              Orchestrator Core                    │
 │  ┌────────────┐ ┌────────────┐ ┌──────────────┐  │
-│  │ DAG Planner│ │Wave Executor│ │ Message Bus │  │
+│  │ DAG Planner│ │Wave Executor│ │ Result Bus  │  │
+│  └────────────┘ └────────────┘ └──────────────┘  │
+│  ┌────────────┐ ┌────────────┐ ┌──────────────┐  │
+│  │File Tracker│ │State (SQLite)│ │Gateway Client│  │
 │  └────────────┘ └────────────┘ └──────────────┘  │
 └──────────────────────────────────────────────────┘
                         │
@@ -184,31 +240,44 @@ port = 8765
     ┌─────────┐   ┌─────────┐   ┌─────────┐
     │ Agent 1 │   │ Agent 2 │   │ Agent N │
     └─────────┘   └─────────┘   └─────────┘
+    (work naturally, no special protocol)
 ```
 
-## Roadmap
+## Status
 
-- [x] Design document
-- [ ] Core orchestration engine
-- [ ] DAG planner (manual + auto)
-- [ ] Wave executor
-- [ ] Message bus
-- [ ] File locking
-- [ ] CLI interface
-- [ ] Web dashboard
-- [ ] OpenClaw gateway integration
-- [ ] Auto-planning with LLM
+### ✅ Implemented
+- [x] Design document (passive observation model)
+- [x] DAG planner (manual YAML + auto via LLM)
+- [x] Wave executor with parallel execution
+- [x] Gateway client (WebSocket + Ed25519 auth)
+- [x] Result bus for inter-task context
+- [x] File scope tracking
+- [x] SQLite persistence (runs, tasks, logs)
+- [x] CLI commands (run, plan, status, logs, etc.)
+- [x] Web dashboard (HTMX + SSE)
+- [x] Pause/resume/kill controls
+
+### 🔜 Planned
 - [ ] Smart retry on failures
-- [ ] Git integration
+- [ ] Progress estimation
+- [ ] Git integration (auto-commit per task)
+- [ ] Cost tracking (token usage)
 - [ ] Distributed execution
+- [ ] Task templates
 
 ## Tech Stack
 
 - **Language:** Rust
-- **Web:** Axum + HTMX + Tailwind
-- **Database:** SQLite
+- **Web:** Axum + HTMX + Tailwind CSS
+- **Database:** SQLite (via sqlx)
 - **Real-time:** SSE (Server-Sent Events)
-- **Agent Runtime:** OpenClaw
+- **Agent Runtime:** OpenClaw Gateway
+
+## Requirements
+
+- OpenClaw installed and configured (`~/.openclaw/identity/device.json`)
+- OpenClaw gateway running (`ws://127.0.0.1:18789`)
+- Rust 1.75+
 
 ## Contributing
 

@@ -1,0 +1,33 @@
+name: "Todo REST API"
+description: "Build a REST API for a todo list app with CRUD operations and SQLite persistence"
+
+tasks:
+  - id: db_schema
+    description: "Create SQLite schema for todos table with id, title, completed, created_at columns"
+    depends_on: []
+    outputs: [migrations/001_todos.sql]
+    
+  - id: db_module
+    description: "Implement database connection pool and CRUD query functions using sqlx"
+    depends_on: [db_schema]
+    outputs: [src/db.rs]
+    
+  - id: models
+    description: "Create Todo struct with serde serialization for JSON API responses"
+    depends_on: []
+    outputs: [src/models.rs]
+    
+  - id: handlers
+    description: "Implement Axum HTTP handlers for GET/POST/PUT/DELETE /todos endpoints"
+    depends_on: [db_module, models]
+    outputs: [src/handlers.rs]
+    
+  - id: routes
+    description: "Configure Axum router and wire up all handlers, add main.rs entry point"
+    depends_on: [handlers]
+    outputs: [src/routes.rs, src/main.rs]
+    
+  - id: tests
+    description: "Write integration tests for all API endpoints using reqwest"
+    depends_on: [routes]
+    outputs: [tests/api_test.rs]
