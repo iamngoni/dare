@@ -470,14 +470,41 @@ impl GatewayClient {
     }
 
     /// Handle an incoming message
-    async fn handle_message(&self, text: &str) -> Result<()> {
+    /// CRITICAL: Responses ("res") are processed inline for RPC reliability.
+    /// Events are processed inline too but we skip noisy streaming events early
+    /// to avoid blocking response processing.
+    async fn handle_message(self: &Arc<Self>, text: &str) -> Result<()> {
         let json: Value = serde_json::from_str(text)?;
         let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match msg_type {
-            "event" => self.handle_event(&json).await,
+            // Responses MUST be processed immediately — RPC callers are waiting
             "res" => self.handle_response(&json).await,
-            _ => Ok(()),
+            "event" => {
+                let event_name = json.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                // Skip noisy streaming events that don't matter for orchestration
+                match event_name {
+                    "agent" | "chat" | "health" | "tick" => {
+                        // Only log cron-relevant agent/chat events (ones with "dare-" in sessionKey)
+                        if event_name == "agent" || event_name == "chat" {
+                            let has_dare = json.get("payload")
+                                .and_then(|p| p.get("sessionKey"))
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.contains("dare-"))
+                                .unwrap_or(false);
+                            if !has_dare {
+                                return Ok(()); // Skip non-dare agent/chat events entirely
+                            }
+                        } else {
+                            return Ok(()); // Skip health/tick
+                        }
+                    }
+                    _ => {}
+                }
+                // Process orchestration-relevant events
+                self.handle_event(&json).await
+            },
+            _ => Ok(())
         }
     }
 
@@ -489,85 +516,144 @@ impl GatewayClient {
             .unwrap_or("unknown");
         let payload = json.get("payload").cloned().unwrap_or(Value::Null);
 
-        // Skip tick events
+        // Skip tick events (too noisy)
         if event_name == "tick" {
             return Ok(());
         }
 
-        // Log all events for debugging
-        info!("Gateway event: {} payload_keys={:?}", event_name, 
-            payload.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
+        // *** COMPREHENSIVE EVENT LOGGING ***
+        debug!(
+            event = %event_name,
+            payload = %serde_json::to_string(&payload).unwrap_or_default(),
+            "Gateway event received"
+        );
+        info!(
+            event = %event_name, 
+            payload_keys = ?payload.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default(),
+            "Gateway event"
+        );
 
         match event_name {
-            "cron" => {
-                // Cron job events
-                let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
-                let job_id = payload.get("jobId").and_then(|j| j.as_str()).unwrap_or("");
-                info!("Cron event: action={} jobId={}", action, job_id);
+            // Handle cron events - check multiple possible action field names
+            "cron" | "cron.event" | "cron.job" => {
+                // Try multiple possible field names for action
+                let action = payload.get("action")
+                    .or_else(|| payload.get("type"))
+                    .or_else(|| payload.get("status"))
+                    .or_else(|| payload.get("event"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
                 
-                // Extract session key if present
-                let session_key = payload.get("sessionKey").and_then(|s| s.as_str()).unwrap_or("");
+                // Try multiple possible field names for job ID
+                let job_id = payload.get("jobId")
+                    .or_else(|| payload.get("job_id"))
+                    .or_else(|| payload.get("id"))
+                    .or_else(|| payload.get("name"))
+                    .and_then(|j| j.as_str())
+                    .unwrap_or("");
                 
-                match action {
-                    "triggered" | "executed" | "fired" | "started" => {
+                info!(action = %action, job_id = %job_id, "Cron event parsed");
+                
+                // Try multiple possible field names for session key
+                let session_key = payload.get("sessionKey")
+                    .or_else(|| payload.get("session_key"))
+                    .or_else(|| payload.get("session"))
+                    .or_else(|| payload.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                
+                // Check if this is our job (contains "dare-")
+                let is_ours = job_id.contains("dare-") || session_key.contains("dare-");
+                
+                if is_ours {
+                    info!(job_id = %job_id, action = %action, session_key = %session_key, "Processing our cron event");
+                }
+                
+                // Expanded action matching to be more lenient
+                let action_lower = action.to_lowercase();
+                if action_lower.contains("trigger") || action_lower.contains("execut") || 
+                   action_lower.contains("fire") || action_lower.contains("start") ||
+                   action_lower.contains("run") || action_lower.contains("spawn") {
+                    if !session_key.is_empty() || is_ours {
+                        // Map session to job
                         if !session_key.is_empty() {
-                            // Map session to job
-                            {
-                                let mut s2j = self.session_to_job.write().await;
-                                s2j.insert(session_key.to_string(), job_id.to_string());
-                            }
-                            
-                            // Update task state
-                            {
-                                let mut tasks = self.tasks.write().await;
-                                if let Some(task) = tasks.get_mut(job_id) {
-                                    task.session_key = Some(session_key.to_string());
-                                    task.state = SessionState::Running;
-                                }
-                            }
-                            
-                            let _ = self.event_tx.send(GatewayEvent::CronTriggered {
-                                job_id: job_id.to_string(),
-                                session_key: session_key.to_string(),
-                            }).await;
+                            let mut s2j = self.session_to_job.write().await;
+                            s2j.insert(session_key.to_string(), job_id.to_string());
                         }
-                    }
-                    "finished" | "completed" => {
-                        // Cron job finished - check status
-                        let status = payload.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                        info!("Cron job finished: jobId={} status={} sessionKey={}", job_id, status, session_key);
                         
                         // Update task state
                         {
                             let mut tasks = self.tasks.write().await;
                             if let Some(task) = tasks.get_mut(job_id) {
-                                if status == "success" || status == "ok" || status.is_empty() {
-                                    task.state = SessionState::Completed;
-                                } else {
-                                    task.state = SessionState::Failed(status.to_string());
-                                }
+                                task.session_key = Some(session_key.to_string());
+                                task.state = SessionState::Running;
                             }
                         }
                         
-                        // Send completion event
-                        if status == "success" || status == "ok" || status.is_empty() {
-                            let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
-                                session_key: session_key.to_string(),
-                            }).await;
-                        } else {
-                            let _ = self.event_tx.send(GatewayEvent::SessionFailed {
-                                session_key: session_key.to_string(),
-                                error: status.to_string(),
-                            }).await;
+                        let _ = self.event_tx.send(GatewayEvent::CronTriggered {
+                            job_id: job_id.to_string(),
+                            session_key: if session_key.is_empty() { job_id.to_string() } else { session_key.to_string() },
+                        }).await;
+                    }
+                } else if action_lower.contains("finish") || action_lower.contains("complet") || 
+                          action_lower.contains("done") || action_lower.contains("end") {
+                    // Cron job finished - check status
+                    let status = payload.get("status")
+                        .or_else(|| payload.get("result"))
+                        .or_else(|| payload.get("outcome"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    
+                    info!(job_id = %job_id, status = %status, session_key = %session_key, "Cron job finished");
+                    
+                    // Update task state
+                    {
+                        let mut tasks = self.tasks.write().await;
+                        if let Some(task) = tasks.get_mut(job_id) {
+                            if status.is_empty() || status == "success" || status == "ok" || status == "completed" {
+                                task.state = SessionState::Completed;
+                            } else {
+                                task.state = SessionState::Failed(status.to_string());
+                            }
                         }
                     }
-                    _ => {}
+                    
+                    // Determine the effective session key (use job_id if session_key is empty)
+                    let effective_session = if session_key.is_empty() { job_id } else { session_key };
+                    
+                    // Send completion event
+                    if status.is_empty() || status == "success" || status == "ok" || status == "completed" {
+                        info!(session_key = %effective_session, "Sending SessionCompleted event");
+                        let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
+                            session_key: effective_session.to_string(),
+                        }).await;
+                    } else {
+                        info!(session_key = %effective_session, error = %status, "Sending SessionFailed event");
+                        let _ = self.event_tx.send(GatewayEvent::SessionFailed {
+                            session_key: effective_session.to_string(),
+                            error: status.to_string(),
+                        }).await;
+                    }
                 }
             }
-            "agent" => {
-                // Agent session state changes
-                let session_key = payload.get("sessionKey").and_then(|s| s.as_str()).unwrap_or("");
-                let state = payload.get("state").and_then(|s| s.as_str()).unwrap_or("unknown");
+            
+            // Handle agent/session events - expanded matching
+            "agent" | "session" | "agent.state" | "session.state" | "sessions" | "subagent" => {
+                // Try multiple possible field names for session key
+                let session_key = payload.get("sessionKey")
+                    .or_else(|| payload.get("session_key"))
+                    .or_else(|| payload.get("session"))
+                    .or_else(|| payload.get("key"))
+                    .or_else(|| payload.get("id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                
+                // Try multiple possible field names for state
+                let state = payload.get("state")
+                    .or_else(|| payload.get("status"))
+                    .or_else(|| payload.get("action"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
                 
                 // Check if this is one of our sessions
                 let job_id = {
@@ -579,50 +665,87 @@ impl GatewayClient {
                 let is_ours = job_id.is_some() || session_key.contains("dare-");
                 
                 if is_ours {
-                    debug!("Agent event for our session: {} state={}", session_key, state);
+                    info!(session_key = %session_key, state = %state, job_id = ?job_id, "Agent event for our session");
                     
-                    match state {
-                        "completed" | "done" | "idle" => {
-                            // Update task state
-                            if let Some(ref jid) = job_id {
-                                let mut tasks = self.tasks.write().await;
-                                if let Some(task) = tasks.get_mut(jid) {
-                                    task.state = SessionState::Completed;
-                                }
+                    let state_lower = state.to_lowercase();
+                    if state_lower.contains("complet") || state_lower.contains("done") || 
+                       state_lower.contains("idle") || state_lower.contains("finish") ||
+                       state_lower.contains("success") {
+                        // Update task state
+                        if let Some(ref jid) = job_id {
+                            let mut tasks = self.tasks.write().await;
+                            if let Some(task) = tasks.get_mut(jid) {
+                                task.state = SessionState::Completed;
                             }
-                            
-                            let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
-                                session_key: session_key.to_string(),
-                            }).await;
                         }
-                        "failed" | "error" => {
-                            let error = payload.get("error")
-                                .and_then(|e| e.as_str())
-                                .unwrap_or("Unknown error")
-                                .to_string();
-                            
-                            if let Some(ref jid) = job_id {
-                                let mut tasks = self.tasks.write().await;
-                                if let Some(task) = tasks.get_mut(jid) {
-                                    task.state = SessionState::Failed(error.clone());
-                                }
+                        
+                        info!(session_key = %session_key, "Agent completed - sending SessionCompleted");
+                        let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
+                            session_key: session_key.to_string(),
+                        }).await;
+                    } else if state_lower.contains("fail") || state_lower.contains("error") || 
+                              state_lower.contains("abort") || state_lower.contains("crash") {
+                        let error = payload.get("error")
+                            .or_else(|| payload.get("message"))
+                            .or_else(|| payload.get("reason"))
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("Unknown error")
+                            .to_string();
+                        
+                        if let Some(ref jid) = job_id {
+                            let mut tasks = self.tasks.write().await;
+                            if let Some(task) = tasks.get_mut(jid) {
+                                task.state = SessionState::Failed(error.clone());
                             }
-                            
-                            let _ = self.event_tx.send(GatewayEvent::SessionFailed {
-                                session_key: session_key.to_string(),
-                                error,
-                            }).await;
                         }
-                        _ => {
-                            let _ = self.event_tx.send(GatewayEvent::SessionStateChanged {
-                                session_key: session_key.to_string(),
-                                state: state.to_string(),
-                            }).await;
-                        }
+                        
+                        info!(session_key = %session_key, error = %error, "Agent failed - sending SessionFailed");
+                        let _ = self.event_tx.send(GatewayEvent::SessionFailed {
+                            session_key: session_key.to_string(),
+                            error,
+                        }).await;
+                    } else {
+                        debug!(session_key = %session_key, state = %state, "Agent state changed");
+                        let _ = self.event_tx.send(GatewayEvent::SessionStateChanged {
+                            session_key: session_key.to_string(),
+                            state: state.to_string(),
+                        }).await;
                     }
+                } else {
+                    debug!(session_key = %session_key, state = %state, "Agent event for other session (ignored)");
                 }
             }
-            _ => {}
+            
+            // Handle subagent completion events
+            "subagent.done" | "subagent.completed" | "subagent.finished" => {
+                let session_key = payload.get("sessionKey")
+                    .or_else(|| payload.get("session"))
+                    .or_else(|| payload.get("label"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                
+                if session_key.contains("dare-") {
+                    info!(session_key = %session_key, "Subagent completed event");
+                    let _ = self.event_tx.send(GatewayEvent::SessionCompleted {
+                        session_key: session_key.to_string(),
+                    }).await;
+                }
+            }
+            
+            // Log any other events that might be relevant
+            _ => {
+                // Check if any field in the payload mentions "dare-" - might be our session
+                let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+                if payload_str.contains("dare-") {
+                    info!(
+                        event = %event_name, 
+                        payload = %payload_str, 
+                        "Unhandled event that mentions 'dare-' - might be relevant"
+                    );
+                } else {
+                    debug!(event = %event_name, "Unhandled event type");
+                }
+            }
         }
 
         Ok(())
@@ -684,7 +807,7 @@ impl GatewayClient {
             .context("Failed to send request")?;
 
         // Wait for response with timeout
-        let result = timeout(Duration::from_secs(30), rx)
+        let result = timeout(Duration::from_secs(60), rx)
             .await
             .context("Request timeout")?
             .context("Response channel closed")?;
@@ -774,35 +897,24 @@ impl GatewayClient {
                     });
                 }
 
-                // Trigger the job immediately
-                let run_result = self.request("cron.run", json!({
-                    "jobId": actual_job_id
-                })).await;
-
-                match run_result {
-                    Ok(run_payload) => {
-                        debug!("Cron job triggered: {:?}", run_payload);
-                        
-                        // Extract session key if provided in response
-                        if let Some(session_key) = run_payload.get("sessionKey").and_then(|s| s.as_str()) {
-                            let mut tasks = self.tasks.write().await;
-                            if let Some(task) = tasks.get_mut(&actual_job_id) {
-                                task.session_key = Some(session_key.to_string());
-                                task.state = SessionState::Running;
-                            }
-                            
-                            let mut s2j = self.session_to_job.write().await;
-                            s2j.insert(session_key.to_string(), actual_job_id.clone());
-                        }
-                        
-                        Ok(actual_job_id)
-                    }
-                    Err(e) => {
-                        // Clean up the cron job
-                        let _ = self.remove_job(&actual_job_id).await;
-                        Err(anyhow!("Failed to trigger cron job: {}", e))
-                    }
+                // Trigger the job immediately — fire and forget
+                // cron.run may not return a timely RPC response (it blocks until
+                // the agent session completes). We rely on cron events (started/finished)
+                // for tracking instead.
+                let cmd_tx = self.command_tx.lock().await;
+                if let Some(ref tx) = *cmd_tx {
+                    let run_req = json!({
+                        "type": "req",
+                        "id": format!("run-{}", uuid::Uuid::new_v4()),
+                        "method": "cron.run",
+                        "params": { "jobId": actual_job_id }
+                    });
+                    let _ = tx.send(WsCommand::Send(serde_json::to_string(&run_req)?)).await;
+                    info!(job_id = %actual_job_id, "Cron job trigger sent (fire-and-forget)");
                 }
+                drop(cmd_tx);
+                
+                Ok(actual_job_id)
             }
             Err(e) => {
                 Err(anyhow!("Failed to create cron job: {}", e))
