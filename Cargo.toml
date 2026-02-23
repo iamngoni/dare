@@ -9,7 +9,12 @@ license = "MIT"
 keywords = ["ai", "agents", "orchestration", "openclaw", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = ["openssl-vendored"]
+openssl-vendored = ["openssl/vendored"]
+
 [dependencies]
+openssl = { version = "0.10", optional = true }
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 
