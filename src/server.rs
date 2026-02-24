@@ -89,6 +89,8 @@ impl DashboardServer {
         let app = Router::new()
             // Main dashboard
             .route("/", get(index_handler))
+            .route("/:id", get(run_page_handler))
+            .route("/run/:id", get(run_page_handler))
             
             // HTMX endpoints (return HTML fragments)
             .route("/htmx/status", get(htmx_status_handler))
@@ -162,6 +164,32 @@ async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+async fn run_page_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let run = state.db.get_run(&id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let tasks = state.db.get_tasks(&id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let completed = tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
+    let total = tasks.len();
+    let progress = if total > 0 { (completed * 100) / total } else { 0 };
+
+    let mut html = String::new();
+    html.push_str(r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>dare.run — Run Details</title><script src="https://unpkg.com/htmx.org@1.9.10"></script><script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/sse.js"></script><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-900 text-gray-100 min-h-screen">"#);
+    html.push_str(r#"<header class="bg-gray-800 border-b border-gray-700 px-6 py-4"><div class="max-w-7xl mx-auto flex items-center justify-between"><a href="/" class="text-gray-300 hover:text-white">← Back to dashboard</a><div class="text-sm text-gray-400">Run focus view</div></div></header>"#);
+    html.push_str(r#"<main class="max-w-7xl mx-auto px-6 py-8">"#);
+    html.push_str(&format!(r#"<div class="mb-6"><h1 class="text-2xl font-semibold">{}</h1><p class="text-gray-400 text-sm">{}</p><div class="mt-2">{}</div><div class="mt-3 h-2 bg-gray-700 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-blue-500 to-indigo-500" style="width:{}%"></div></div><p class="text-xs text-gray-400 mt-1">{}% complete</p></div>"#, run.name, run.id, status_badge_html(&format!("{:?}", run.status)), progress, progress));
+    html.push_str(&format!(r#"<div id="waves-container" hx-get="/htmx/run/{}/waves" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>"#, id));
+    html.push_str(r#"</main></body></html>"#);
+
+    Ok(Html(html))
+}
+
 // ===== HTMX Handlers (return HTML fragments) =====
 
 async fn htmx_status_handler(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -200,9 +228,9 @@ async fn htmx_status_handler(State(state): State<Arc<AppState>>) -> Html<String>
         
         // Actions
         html.push_str(r##"<div class="mt-4 flex gap-2">"##);
-        html.push_str(r##"<button hx-get="/htmx/run/"##);
+        html.push_str(r##"<a href="/"##);
         html.push_str(&run.id);
-        html.push_str(r##"" hx-target="#run-detail" hx-swap="innerHTML" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 rounded text-sm font-medium">View Details</button>"##);
+        html.push_str(r##"" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 rounded text-sm font-medium">View Details</a>"##);
         html.push_str(r##"<button hx-post="/api/runs/"##);
         html.push_str(&run.id);
         html.push_str(r##"/pause" hx-swap="none" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm font-medium">Pause</button>"##);
@@ -225,15 +253,15 @@ async fn htmx_runs_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     
     let mut html = String::new();
     for run in runs {
-        html.push_str(r##"<div class="bg-gray-800 rounded-lg p-4 border border-gray-700 hover:border-gray-600 cursor-pointer" hx-get="/htmx/run/"##);
+        html.push_str(r##"<a class="block bg-gray-800 rounded-lg p-4 border border-gray-700 hover:border-gray-600 cursor-pointer" href="/"##);
         html.push_str(&run.id);
-        html.push_str(r##"" hx-target="#run-detail" hx-swap="innerHTML"><div class="flex items-center justify-between"><div><h3 class="font-medium text-white">"##);
+        html.push_str(r##""><div class="flex items-center justify-between"><div><h3 class="font-medium text-white">"##);
         html.push_str(&run.name);
         html.push_str(r##"</h3><p class="text-xs text-gray-500">"##);
         html.push_str(&run.created_at.format("%Y-%m-%d %H:%M").to_string());
         html.push_str(r##"</p></div>"##);
         html.push_str(&status_badge_html(&format!("{:?}", run.status)));
-        html.push_str(r##"</div></div>"##);
+        html.push_str(r##"</div></a>"##);
     }
     
     Html(html)

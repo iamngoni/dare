@@ -1,0 +1,8 @@
+name: "Smoke Test"
+description: "Tiny run to verify dashboard progress UI"
+
+tasks:
+  - id: create_file
+    description: "Create a marker file at /tmp/dare-smoke.txt with content 'ok'"
+    depends_on: []
+    outputs: [/tmp/dare-smoke.txt]

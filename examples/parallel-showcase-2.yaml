@@ -1,0 +1,38 @@
+name: "Parallel Showcase 2"
+description: "Show multiple agents running in parallel across waves"
+
+tasks:
+  - id: p2_spec_notes
+    description: "Create /tmp/dare-show/spec.md with a short API spec summary"
+    depends_on: []
+    outputs: [/tmp/dare-show/spec.md]
+
+  - id: p2_schema_notes
+    description: "Create /tmp/dare-show/schema.sql with a simple SQL table definition"
+    depends_on: []
+    outputs: [/tmp/dare-show/schema.sql]
+
+  - id: p2_model_notes
+    description: "Create /tmp/dare-show/models.md describing a Todo model"
+    depends_on: []
+    outputs: [/tmp/dare-show/models.md]
+
+  - id: p2_test_plan
+    description: "Create /tmp/dare-show/test-plan.md with 5 API test cases"
+    depends_on: []
+    outputs: [/tmp/dare-show/test-plan.md]
+
+  - id: p2_integrate_api
+    description: "Create /tmp/dare-show/api.md combining spec and model notes"
+    depends_on: [p2_spec_notes, p2_model_notes]
+    outputs: [/tmp/dare-show/api.md]
+
+  - id: p2_integrate_db
+    description: "Create /tmp/dare-show/db.md combining schema and test plan notes"
+    depends_on: [p2_schema_notes, p2_test_plan]
+    outputs: [/tmp/dare-show/db.md]
+
+  - id: p2_final_summary
+    description: "Create /tmp/dare-show/summary.md that summarizes all previous outputs"
+    depends_on: [p2_integrate_api, p2_integrate_db]
+    outputs: [/tmp/dare-show/summary.md]
