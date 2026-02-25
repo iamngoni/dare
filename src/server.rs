@@ -108,6 +108,10 @@ impl DashboardServer {
             .route("/action/launch", post(action_launch_council))
             .route("/action/message/:id", post(action_send_message))
             
+            // Agent messaging API (used by spawned agents to communicate)
+            .route("/api/council/:id/post", post(api_agent_post_message))
+            .route("/api/council/:id/messages", get(api_agent_get_messages))
+            
             // JSON API
             .route("/api/status", get(api_status))
             .route("/api/runs", get(api_runs))
@@ -995,8 +999,7 @@ async fn action_send_message(
         "sender": "human",
         "text": msg,
     });
-    state.db.insert_message(&id, None, "human", &payload).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = state.db.insert_message(&id, None, "human", &payload).await;
 
     // TODO: Forward to active agent sessions via gateway
     // For now, just store it so it shows up in the chat
@@ -1188,30 +1191,57 @@ fn build_council_messages(
         }
     }
 
-    // Stored messages (human input, system messages)
+    // Stored messages (human input, agent chat, system messages)
     for (_id, _task_id, msg_type, payload, created_at) in stored_messages.iter().rev() {
         let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let sender = payload.get("sender").and_then(|v| v.as_str()).unwrap_or("system");
+        let tag_value = payload.get("tag").and_then(|v| v.as_str()).unwrap_or("");
         let time_str = created_at.format("%H:%M").to_string();
 
-        let (avatar_class, name, tag) = match sender {
-            "human" => ("system", "YOU", r##"<span class="msg-tag decision">HUMAN</span>"##),
-            _ => ("system", "SYSTEM", ""),
+        let (avatar_class, name_style, avatar_content) = match msg_type.as_str() {
+            "human" => ("system", "color:var(--c-accent);", "▶".to_string()),
+            "agent" => {
+                let role = agent_role(sender);
+                let initials = sender.chars().take(2).collect::<String>().to_uppercase();
+                (role, match role {
+                    "planner" => "color:var(--c-accent);",
+                    "reviewer" => "color:var(--c-warning);",
+                    "tester" => "color:var(--c-info);",
+                    _ => "color:var(--c-text);",
+                }, initials)
+            }
+            _ => ("system", "color:var(--c-muted);", "⚙".to_string()),
+        };
+
+        let display_name = match msg_type.as_str() {
+            "human" => "YOU".to_string(),
+            "agent" => sender.to_string(),
+            _ => "SYSTEM".to_string(),
+        };
+
+        let tag_html = match tag_value {
+            "question" => r##"<span class="msg-tag question">QUESTION</span>"##,
+            "decision" => r##"<span class="msg-tag decision">DECISION</span>"##,
+            "challenge" => r##"<span class="msg-tag challenge">CHALLENGE</span>"##,
+            "request" => r##"<span class="msg-tag question">REQUEST</span>"##,
+            "update" => r##"<span class="msg-tag decision">UPDATE</span>"##,
+            _ if msg_type == "human" => r##"<span class="msg-tag decision">HUMAN</span>"##,
+            _ => "",
         };
 
         let html = format!(
             r##"<div class="msg">
-                <div class="msg-avatar {}" style="background:var(--c-accent-soft);color:var(--c-accent);">▶</div>
+                <div class="msg-avatar {}">{}</div>
                 <div class="msg-body">
                     <div class="msg-header">
-                        <span class="msg-name" style="color:var(--c-accent);">{}</span>
+                        <span class="msg-name" style="{}">{}</span>
                         <span class="msg-time">{}</span>
                         {}
                     </div>
                     <div class="msg-text">{}</div>
                 </div>
             </div>"##,
-            avatar_class, name, time_str, tag, text
+            avatar_class, avatar_content, name_style, display_name, time_str, tag_html, text
         );
         timeline.push((*created_at, html));
     }
@@ -1277,6 +1307,95 @@ fn build_task_graph_html(tasks: &[crate::models::Task], max_wave: usize) -> Stri
     }
 
     html
+}
+
+// ===== Agent Messaging API =====
+// These endpoints are called by spawned agents to communicate with each other
+
+#[derive(Deserialize)]
+struct AgentPostMessage {
+    sender: String,
+    text: String,
+    #[serde(default)]
+    tag: Option<String>, // "question", "decision", "challenge", "update", "request"
+}
+
+async fn api_agent_post_message(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Json(msg): Json<AgentPostMessage>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Verify run exists
+    let _run = state.db.get_run(&run_id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let payload = serde_json::json!({
+        "sender": msg.sender,
+        "text": msg.text,
+        "tag": msg.tag,
+    });
+
+    // Check if sender is a valid task_id in this run
+    let task_ref = state.db.get_task(&msg.sender).await.ok().flatten();
+    let task_id_ref = task_ref.as_ref().map(|t| t.id.as_str());
+    
+    let msg_id = state.db.insert_message(&run_id, task_id_ref, "agent", &payload).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Broadcast via SSE so the dashboard updates in real-time
+    let feed_html = format!(
+        r##"<div class="feed-item"><span class="feed-text info">{}: {}</span><span class="feed-time">{}</span></div>"##,
+        msg.sender,
+        if msg.text.len() > 60 { format!("{}...", &msg.text[..60]) } else { msg.text.clone() },
+        chrono::Local::now().format("%H:%M:%S")
+    );
+    let _ = state.events_tx.send(TaskMessage::Running { task_id: format!("msg:{}", msg.sender) });
+
+    Ok(Json(serde_json::json!({ "ok": true, "id": msg_id })))
+}
+
+#[derive(Deserialize)]
+struct AgentGetMessagesQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    since_id: Option<i64>,
+}
+
+fn default_limit() -> usize { 50 }
+
+async fn api_agent_get_messages(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Query(params): Query<AgentGetMessagesQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let messages = state.db.get_messages(&run_id, params.limit).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let result: Vec<serde_json::Value> = messages.iter()
+        .rev() // Reverse to chronological order
+        .filter(|(id, _, _, _, _)| {
+            if let Some(since) = params.since_id {
+                *id > since
+            } else {
+                true
+            }
+        })
+        .map(|(id, task_id, msg_type, payload, created_at)| {
+            serde_json::json!({
+                "id": id,
+                "task_id": task_id,
+                "type": msg_type,
+                "sender": payload.get("sender").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "text": payload.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                "tag": payload.get("tag").and_then(|v| v.as_str()),
+                "timestamp": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(result))
 }
 
 // ===== JSON API Handlers =====

@@ -218,7 +218,7 @@ impl WaveExecutor {
     /// Execute a single wave of tasks
     async fn execute_wave(
         &self,
-        _run: &Run,
+        run: &Run,
         tasks: &[&TaskNode],
         max_parallel: usize,
         gateway: &std::sync::Arc<GatewayClient>,
@@ -272,7 +272,7 @@ impl WaveExecutor {
                     spawned_task_ids.insert(task.id.clone());
                     
                     // Build context for the task
-                    let context = self.build_agent_context(task, result_bus);
+                    let context = self.build_agent_context(task, result_bus, &run.id);
                     let label = format!("dare-{}", task.id);
 
                     // Spawn via gateway cron API
@@ -624,7 +624,7 @@ impl WaveExecutor {
     }
 
     /// Build the context/prompt for an agent
-    fn build_agent_context(&self, task: &TaskNode, result_bus: &ResultBus) -> String {
+    fn build_agent_context(&self, task: &TaskNode, result_bus: &ResultBus, run_id: &str) -> String {
         let dep_context = result_bus.get_dependency_context(task);
         
         let files_list = if task.outputs.is_empty() {
@@ -637,9 +637,15 @@ impl WaveExecutor {
                 .join("\n")
         };
 
+        let dashboard_port = self.config.dashboard.port;
+        let council_api = format!("http://127.0.0.1:{}/api/council/{}", dashboard_port, run_id);
+
         format!(
             r#"# Task: {task_id}
 
+You are agent **{task_id}** in a dare council — a team of AI agents collaborating on a project.
+
+## Your Task
 {description}
 
 ## Files You're Working On
@@ -647,14 +653,39 @@ impl WaveExecutor {
 
 {dep_section}
 
-## Instructions
-Complete this task. When you're done, the task is complete — no special markers needed.
-Just do your work naturally and ensure the expected files are properly created/modified.
+## Council Chat
+You are part of an active council. Other agents are working on related tasks in parallel.
+**Communicate with them** — share decisions, ask questions, flag issues.
 
-Focus on:
-1. Understanding the task requirements
-2. Implementing the solution correctly
-3. Ensuring code compiles and is well-structured
+To post a message to the council:
+```bash
+curl -s -X POST {council_api}/post \
+  -H "Content-Type: application/json" \
+  -d '{{"sender": "{task_id}", "text": "your message here", "tag": "update"}}'
+```
+
+To read messages from other agents:
+```bash
+curl -s {council_api}/messages | python3 -m json.tool
+```
+
+**Tags:** "update" (progress), "question" (need input), "decision" (made a choice), "challenge" (disagree), "request" (need something from another agent)
+
+**When to communicate:**
+- When you make a significant design decision — share it
+- When you need information from another agent's work — ask
+- When you disagree with an approach you see — challenge it
+- When you complete your task — announce it
+- When you're blocked — say so
+
+## Instructions
+1. Read existing council messages first to understand what others are doing
+2. Share your approach before diving into implementation
+3. Do your work — create/modify the expected files
+4. Post updates as you make progress
+5. Announce when you're done
+
+Work naturally. Be a good teammate.
 "#,
             task_id = task.id,
             description = task.description,
@@ -663,7 +694,8 @@ Focus on:
                 String::new()
             } else {
                 format!("## Context from Completed Tasks\n{}", dep_context)
-            }
+            },
+            council_api = council_api,
         )
     }
 }
