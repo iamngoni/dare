@@ -15,7 +15,7 @@ use crate::dag::{TaskGraph, TaskNode};
 use crate::db::Database;
 use crate::gateway::{GatewayClient, GatewayConfig, GatewayEvent, SessionState};
 use crate::message_bus::TaskMessage;
-use crate::models::{Run, RunStatus, TaskId, TaskStatus};
+use crate::models::{AgentProfile, Run, RunStatus, TaskId, TaskStatus};
 
 /// Result bus for inter-task data passing
 pub struct ResultBus {
@@ -272,7 +272,9 @@ impl WaveExecutor {
                     spawned_task_ids.insert(task.id.clone());
                     
                     // Build context for the task
-                    let context = self.build_agent_context(task, result_bus, &run.id);
+                    // Try to match task to an agent profile by codename
+                    let profile = self.db.get_profile_by_codename(&task.id).await.ok().flatten();
+                    let context = self.build_agent_context(task, result_bus, &run.id, profile.as_ref());
                     let label = format!("dare-{}", task.id);
 
                     // Spawn via gateway cron API
@@ -624,7 +626,7 @@ impl WaveExecutor {
     }
 
     /// Build the context/prompt for an agent
-    fn build_agent_context(&self, task: &TaskNode, result_bus: &ResultBus, run_id: &str) -> String {
+    fn build_agent_context(&self, task: &TaskNode, result_bus: &ResultBus, run_id: &str, profile: Option<&AgentProfile>) -> String {
         let dep_context = result_bus.get_dependency_context(task);
         
         let files_list = if task.outputs.is_empty() {
@@ -640,12 +642,31 @@ impl WaveExecutor {
         let dashboard_port = self.config.dashboard.port;
         let council_api = format!("http://127.0.0.1:{}/api/council/{}", dashboard_port, run_id);
 
+        let profile_section = if let Some(p) = profile {
+            format!(
+                r#"## Your Identity
+**Name:** {} ({})
+**Role:** {}
+**Expertise:** {}
+**Personality:** {}
+
+{}
+"#,
+                p.name, p.codename, p.role,
+                if p.expertise.is_empty() { "General" } else { &p.expertise },
+                if p.personality.is_empty() { "Professional" } else { &p.personality },
+                if p.system_context.is_empty() { String::new() } else { format!("## System Instructions\n{}", p.system_context) }
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             r#"# Task: {task_id}
 
 You are agent **{task_id}** in a dare council — a team of AI agents collaborating on a project.
 
-## Your Task
+{profile_section}## Your Task
 {description}
 
 ## Files You're Working On

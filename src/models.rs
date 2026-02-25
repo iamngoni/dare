@@ -119,6 +119,49 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
+/// An agent profile — a persistent persona that can be assigned to tasks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub id: String,
+    pub name: String,
+    pub codename: String,
+    pub role: String,
+    pub expertise: String,
+    pub personality: String,
+    pub system_context: String,
+    pub model: Option<String>,
+    pub avatar_emoji: String,
+    pub color: String,
+    pub is_active: bool,
+    pub tasks_completed: i64,
+    pub tasks_failed: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentProfile {
+    pub fn new(codename: &str, name: &str, role: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            codename: codename.to_string(),
+            role: role.to_string(),
+            expertise: String::new(),
+            personality: String::new(),
+            system_context: String::new(),
+            model: None,
+            avatar_emoji: "🤖".to_string(),
+            color: "#00FF88".to_string(),
+            is_active: true,
+            tasks_completed: 0,
+            tasks_failed: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 /// Task complexity estimation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Complexity {

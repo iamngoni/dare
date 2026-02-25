@@ -1,0 +1,18 @@
+name: "Auth System Design"
+description: "Design an authentication system — agents should discuss and coordinate"
+
+tasks:
+  - id: schema_designer
+    description: "Design the database schema for user authentication (users table, sessions table, refresh tokens). Post your schema design to the council chat and ask for feedback before finalizing. Write the SQL to /tmp/dare-chat/schema.sql"
+    depends_on: []
+    outputs: [/tmp/dare-chat/schema.sql]
+
+  - id: api_architect
+    description: "Design the REST API endpoints for auth (register, login, logout, refresh, me). Post your endpoint list to the council chat. Check what the schema_designer decided for the database and align your request/response shapes. Write the API spec to /tmp/dare-chat/api.md"
+    depends_on: []
+    outputs: [/tmp/dare-chat/api.md]
+
+  - id: security_reviewer
+    description: "Review the auth system design. Read council messages from schema_designer and api_architect. Challenge any security concerns you see (password hashing, token expiry, rate limiting). Post your security review to the council. Write your findings to /tmp/dare-chat/security-review.md"
+    depends_on: [schema_designer, api_architect]
+    outputs: [/tmp/dare-chat/security-review.md]

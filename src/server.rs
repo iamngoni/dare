@@ -94,6 +94,9 @@ impl DashboardServer {
             .route("/council/:id", get(page_council))
             .route("/tasks/:id", get(page_tasks))
             .route("/new", get(page_new_council))
+            .route("/profiles", get(page_profiles))
+            .route("/profiles/new", get(page_profile_new))
+            .route("/profiles/:id/edit", get(page_profile_edit))
             .route("/run/:id", get(page_run))
             
             // HTMX fragments
@@ -107,6 +110,9 @@ impl DashboardServer {
             // Actions (form submissions)
             .route("/action/launch", post(action_launch_council))
             .route("/action/message/:id", post(action_send_message))
+            .route("/action/profile/create", post(action_profile_create))
+            .route("/action/profile/:id/update", post(action_profile_update))
+            .route("/action/profile/:id/delete", post(action_profile_delete))
             
             // Agent messaging API (used by spawned agents to communicate)
             .route("/api/council/:id/post", post(api_agent_post_message))
@@ -157,6 +163,7 @@ fn sidebar(active: &str, latest_run_id: Option<&str>) -> String {
         ("layout-dashboard", "OVERVIEW", "/".to_string()),
         ("message-square", "COUNCIL", council_href),
         ("git-branch", "TASKS", tasks_href),
+        ("user-cog", "PROFILES", "/profiles".to_string()),
         ("users", "AGENTS", "/agents".to_string()),
         ("archive", "HISTORY", "/history".to_string()),
     ];
@@ -1005,6 +1012,297 @@ async fn action_send_message(
     // For now, just store it so it shows up in the chat
 
     Ok(Html(String::new()))
+}
+
+// ===== Page: Profiles =====
+
+async fn page_profiles(State(state): State<Arc<AppState>>) -> Html<String> {
+    let profiles = state.db.list_profiles(false).await.unwrap_or_default();
+    let latest_id = get_latest_run_id(&state.db).await;
+
+    let mut cards_html = String::new();
+    for p in &profiles {
+        let active_class = if p.is_active { "badge-active" } else { "badge-pending" };
+        let active_text = if p.is_active { "[ACTIVE]" } else { "[INACTIVE]" };
+        let success_rate = if p.tasks_completed + p.tasks_failed > 0 {
+            format!("{:.0}%", (p.tasks_completed as f64 / (p.tasks_completed + p.tasks_failed) as f64) * 100.0)
+        } else { "—".to_string() };
+
+        cards_html.push_str(&format!(
+            r##"<div class="panel" style="gap:12px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span style="font-size:28px;">{}</span>
+                        <div>
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <span style="font-size:16px;font-weight:700;font-family:'Space Grotesk',sans-serif;">{}</span>
+                                <span class="badge {}">{}</span>
+                            </div>
+                            <span style="font-size:11px;color:var(--c-muted);">{} · @{}</span>
+                        </div>
+                    </div>
+                    <a href="/profiles/{}/edit" class="btn-outline" style="font-size:10px;">
+                        <i data-lucide="edit-2" style="width:12px;height:12px;"></i> EDIT
+                    </a>
+                </div>
+                <div style="font-size:11px;color:var(--c-muted);line-height:1.6;">{}</div>
+                <div style="display:flex;gap:24px;font-size:10px;">
+                    <span style="color:var(--c-muted);">Personality: <span style="color:var(--c-text);">{}</span></span>
+                </div>
+                <div style="display:flex;gap:24px;font-size:10px;color:var(--c-muted);">
+                    <span>Tasks: <span style="color:var(--c-accent);">{}</span> completed</span>
+                    <span>Failed: <span style="color:var(--c-danger);">{}</span></span>
+                    <span>Success: <span style="color:var(--c-accent);">{}</span></span>
+                    {}
+                </div>
+            </div>"##,
+            p.avatar_emoji, p.name, active_class, active_text,
+            p.role, p.codename,
+            p.id,
+            if p.expertise.is_empty() { "No expertise defined" } else { &p.expertise },
+            if p.personality.is_empty() { "Default" } else { &p.personality },
+            p.tasks_completed, p.tasks_failed, success_rate,
+            p.model.as_deref().map(|m| format!(r##"<span>Model: <span style="color:var(--c-info);">{}</span></span>"##, m)).unwrap_or_default()
+        ));
+    }
+
+    if cards_html.is_empty() {
+        cards_html = r##"<div style="text-align:center;padding:60px 0;color:#3f3f3f;">
+            <p style="font-size:32px;margin-bottom:12px;">🤖</p>
+            <p>No agent profiles yet</p>
+            <p style="font-size:10px;margin-top:8px;">Create profiles to give your council agents personality and expertise</p>
+        </div>"##.to_string();
+    }
+
+    let body = format!(
+        r##"{}
+    <div class="main-content">
+        <div class="header-row">
+            <div>
+                <h1 class="header-title">Agent Profiles</h1>
+                <div class="header-sub">// DEFINE YOUR COUNCIL MEMBERS</div>
+            </div>
+            <div class="header-right">
+                <a href="/profiles/new" class="btn-primary">
+                    <i data-lucide="plus" style="width:14px;height:14px;"></i>
+                    NEW PROFILE
+                </a>
+            </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:16px;">
+            {}
+        </div>
+    </div>"##,
+        sidebar("profiles", latest_id.as_deref()),
+        cards_html
+    );
+
+    Html(render_page("Agent Profiles", &body))
+}
+
+async fn page_profile_new(State(state): State<Arc<AppState>>) -> Html<String> {
+    let latest_id = get_latest_run_id(&state.db).await;
+    Html(render_page("New Profile", &render_profile_form(
+        &sidebar("profiles", latest_id.as_deref()),
+        None, "", "", "", "", "", "", "", "🤖", "#00FF88"
+    )))
+}
+
+async fn page_profile_edit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let profile = state.db.get_profile(&id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let latest_id = get_latest_run_id(&state.db).await;
+
+    Ok(Html(render_page(&format!("Edit — {}", profile.name), &render_profile_form(
+        &sidebar("profiles", latest_id.as_deref()),
+        Some(&profile.id),
+        &profile.name, &profile.codename, &profile.role,
+        &profile.expertise, &profile.personality, &profile.system_context,
+        profile.model.as_deref().unwrap_or(""),
+        &profile.avatar_emoji, &profile.color
+    ))))
+}
+
+fn render_profile_form(
+    sidebar_html: &str,
+    id: Option<&str>,
+    name: &str, codename: &str, role: &str,
+    expertise: &str, personality: &str, system_context: &str,
+    model: &str, emoji: &str, color: &str,
+) -> String {
+    let (action_url, title, button_text) = if let Some(pid) = id {
+        (format!("/action/profile/{}/update", pid), "Edit Profile", "SAVE CHANGES")
+    } else {
+        ("/action/profile/create".to_string(), "New Profile", "CREATE PROFILE")
+    };
+
+    let delete_btn = if let Some(pid) = id {
+        format!(
+            r##"<button hx-post="/action/profile/{}/delete" hx-confirm="Delete this profile?" class="btn-outline" style="border-color:var(--c-danger);color:var(--c-danger);">
+                <i data-lucide="trash-2" style="width:14px;height:14px;"></i> DELETE
+            </button>"##,
+            pid
+        )
+    } else { String::new() };
+
+    format!(
+        r##"{}
+    <div class="main-content">
+        <div class="form-center" style="max-width:720px;">
+            <div class="form-title-block">
+                <h1 class="form-title">{}</h1>
+                <div class="form-sub">// GIVE YOUR AGENT A PERSONALITY</div>
+            </div>
+
+            <form action="{}" method="POST">
+                <div class="form-row" style="margin-bottom:24px;">
+                    <div class="form-field" style="flex:0 0 80px;">
+                        <span class="form-label">AVATAR</span>
+                        <input type="text" name="avatar_emoji" value="{}" class="form-select" style="font-size:28px;text-align:center;height:60px;">
+                    </div>
+                    <div class="form-field">
+                        <span class="form-label">NAME</span>
+                        <input type="text" name="name" value="{}" placeholder="The Architect" class="form-select" required>
+                    </div>
+                    <div class="form-field">
+                        <span class="form-label">CODENAME</span>
+                        <input type="text" name="codename" value="{}" placeholder="architect" class="form-select" required pattern="[a-z0-9_-]+">
+                        <span class="form-hint">lowercase, no spaces — used in task assignments</span>
+                    </div>
+                </div>
+
+                <div class="form-section" style="margin-bottom:24px;">
+                    <span class="form-label">ROLE</span>
+                    <input type="text" name="role" value="{}" placeholder="Database Architect" class="form-select" required>
+                </div>
+
+                <div class="form-section" style="margin-bottom:24px;">
+                    <span class="form-label">EXPERTISE</span>
+                    <textarea class="form-textarea" name="expertise" placeholder="Expert in PostgreSQL. Follows 3NF. Prefers UUIDs over auto-increment.&#10;Always includes audit columns. Opinionated about indexing.&#10;10+ years building data models for high-traffic systems." style="min-height:100px;">{}</textarea>
+                    <span class="form-hint">What this agent knows and is good at</span>
+                </div>
+
+                <div class="form-section" style="margin-bottom:24px;">
+                    <span class="form-label">PERSONALITY</span>
+                    <textarea class="form-textarea" name="personality" placeholder="Methodical and precise. Asks clarifying questions before acting.&#10;Will push back on shortcuts that compromise data integrity.&#10;Communicates decisions with clear reasoning." style="min-height:80px;">{}</textarea>
+                    <span class="form-hint">How this agent communicates and makes decisions</span>
+                </div>
+
+                <div class="form-section" style="margin-bottom:24px;">
+                    <span class="form-label">SYSTEM CONTEXT</span>
+                    <textarea class="form-textarea" name="system_context" placeholder="You are a senior database architect. When designing schemas:&#10;- Always use UUID primary keys&#10;- Include created_at and updated_at on every table&#10;- Add appropriate indexes for query patterns&#10;- Consider data integrity constraints" style="min-height:120px;">{}</textarea>
+                    <span class="form-hint">Injected as system context when this agent is spawned — instructions, rules, preferences</span>
+                </div>
+
+                <div class="form-row" style="margin-bottom:24px;">
+                    <div class="form-field">
+                        <span class="form-label">MODEL (OPTIONAL)</span>
+                        <select class="form-select" name="model">
+                            <option value="" {}>Default (council setting)</option>
+                            <option value="claude-opus-4" {}>claude-opus-4</option>
+                            <option value="claude-sonnet-4" {}>claude-sonnet-4</option>
+                            <option value="gpt-4o" {}>gpt-4o</option>
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <span class="form-label">COLOR</span>
+                        <input type="color" name="color" value="{}" style="height:40px;width:100%;background:var(--c-surface);border:1px solid var(--c-border);cursor:pointer;">
+                    </div>
+                </div>
+
+                <div class="launch-row">
+                    {}
+                    <button type="submit" class="btn-launch">
+                        <i data-lucide="save" style="width:16px;height:16px;"></i>
+                        {}
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>"##,
+        sidebar_html, title, action_url,
+        emoji, name, codename, role,
+        expertise, personality, system_context,
+        if model.is_empty() { "selected" } else { "" },
+        if model == "claude-opus-4" { "selected" } else { "" },
+        if model == "claude-sonnet-4" { "selected" } else { "" },
+        if model == "gpt-4o" { "selected" } else { "" },
+        color,
+        delete_btn, button_text
+    )
+}
+
+// Profile action handlers
+
+#[derive(Deserialize)]
+struct ProfileForm {
+    name: String,
+    codename: String,
+    role: String,
+    #[serde(default)]
+    expertise: String,
+    #[serde(default)]
+    personality: String,
+    #[serde(default)]
+    system_context: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    avatar_emoji: String,
+    #[serde(default)]
+    color: String,
+}
+
+async fn action_profile_create(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<ProfileForm>,
+) -> impl IntoResponse {
+    use crate::models::AgentProfile;
+
+    let mut profile = AgentProfile::new(&form.codename, &form.name, &form.role);
+    profile.expertise = form.expertise;
+    profile.personality = form.personality;
+    profile.system_context = form.system_context;
+    profile.model = if form.model.is_empty() { None } else { Some(form.model) };
+    profile.avatar_emoji = if form.avatar_emoji.is_empty() { "🤖".to_string() } else { form.avatar_emoji };
+    profile.color = if form.color.is_empty() { "#00FF88".to_string() } else { form.color };
+
+    match state.db.create_profile(&profile).await {
+        Ok(_) => Redirect::to("/profiles"),
+        Err(_) => Redirect::to("/profiles/new"),
+    }
+}
+
+async fn action_profile_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<ProfileForm>,
+) -> impl IntoResponse {
+    if let Ok(Some(mut profile)) = state.db.get_profile(&id).await {
+        profile.name = form.name;
+        profile.codename = form.codename;
+        profile.role = form.role;
+        profile.expertise = form.expertise;
+        profile.personality = form.personality;
+        profile.system_context = form.system_context;
+        profile.model = if form.model.is_empty() { None } else { Some(form.model) };
+        profile.avatar_emoji = if form.avatar_emoji.is_empty() { "🤖".to_string() } else { form.avatar_emoji };
+        profile.color = if form.color.is_empty() { "#00FF88".to_string() } else { form.color };
+        let _ = state.db.update_profile(&profile).await;
+    }
+    Redirect::to("/profiles")
+}
+
+async fn action_profile_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let _ = state.db.delete_profile(&id).await;
+    Redirect::to("/profiles")
 }
 
 // ===== HTMX Fragment Handlers =====

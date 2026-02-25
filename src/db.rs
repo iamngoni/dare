@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::dag::TaskGraph;
-use crate::models::{AgentLog, Run, RunStatus, Task, TaskStatus};
+use crate::models::{AgentLog, AgentProfile, Run, RunStatus, Task, TaskStatus};
 
 /// Default connection pool size
 const DEFAULT_POOL_SIZE: u32 = 5;
@@ -124,7 +124,14 @@ impl Database {
         sqlx::query(include_str!("../migrations/001_initial.sql"))
             .execute(&self.pool)
             .await
-            .context("Failed to run database migrations")?;
+            .context("Failed to run initial migration")?;
+        // Run each additional migration, ignoring "already exists" errors
+        let migration_002 = include_str!("../migrations/002_agent_profiles.sql");
+        for statement in migration_002.split(';') {
+            let stmt = statement.trim();
+            if stmt.is_empty() { continue; }
+            let _ = sqlx::query(stmt).execute(&self.pool).await;
+        }
         Ok(())
     }
 
@@ -553,6 +560,98 @@ impl Database {
     // ========================================================================
     // File Locks
     // ========================================================================
+    // Agent Profiles
+    // ========================================================================
+
+    pub async fn create_profile(&self, profile: &AgentProfile) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_profiles (id, name, codename, role, expertise, personality, system_context, model, avatar_emoji, color, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&profile.id)
+        .bind(&profile.name)
+        .bind(&profile.codename)
+        .bind(&profile.role)
+        .bind(&profile.expertise)
+        .bind(&profile.personality)
+        .bind(&profile.system_context)
+        .bind(&profile.model)
+        .bind(&profile.avatar_emoji)
+        .bind(&profile.color)
+        .bind(profile.is_active)
+        .bind(profile.created_at.to_rfc3339())
+        .bind(profile.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_profile(&self, id: &str) -> Result<Option<AgentProfile>> {
+        let row: Option<SqliteRow> = sqlx::query("SELECT * FROM agent_profiles WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| parse_profile(&r)))
+    }
+
+    pub async fn get_profile_by_codename(&self, codename: &str) -> Result<Option<AgentProfile>> {
+        let row: Option<SqliteRow> = sqlx::query("SELECT * FROM agent_profiles WHERE codename = ?")
+            .bind(codename)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| parse_profile(&r)))
+    }
+
+    pub async fn list_profiles(&self, active_only: bool) -> Result<Vec<AgentProfile>> {
+        let query = if active_only {
+            "SELECT * FROM agent_profiles WHERE is_active = 1 ORDER BY name"
+        } else {
+            "SELECT * FROM agent_profiles ORDER BY name"
+        };
+        let rows: Vec<SqliteRow> = sqlx::query(query).fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| parse_profile(r)).collect())
+    }
+
+    pub async fn update_profile(&self, profile: &AgentProfile) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_profiles SET name=?, codename=?, role=?, expertise=?, personality=?, system_context=?, model=?, avatar_emoji=?, color=?, is_active=?, updated_at=? WHERE id=?"
+        )
+        .bind(&profile.name)
+        .bind(&profile.codename)
+        .bind(&profile.role)
+        .bind(&profile.expertise)
+        .bind(&profile.personality)
+        .bind(&profile.system_context)
+        .bind(&profile.model)
+        .bind(&profile.avatar_emoji)
+        .bind(&profile.color)
+        .bind(profile.is_active)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&profile.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_profile(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn increment_profile_stats(&self, id: &str, completed: bool) -> Result<()> {
+        let col = if completed { "tasks_completed" } else { "tasks_failed" };
+        sqlx::query(&format!("UPDATE agent_profiles SET {} = {} + 1 WHERE id = ?", col, col))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // File Locks
+    // ========================================================================
 
     /// Acquire a file lock
     pub async fn acquire_lock(
@@ -951,6 +1050,26 @@ fn row_to_file_lock(row: &SqliteRow) -> FileLock {
             .unwrap_or_else(Utc::now),
         expires_at: parse_datetime(row.get::<Option<String>, _>("expires_at"))
             .unwrap_or_else(Utc::now),
+    }
+}
+
+fn parse_profile(row: &SqliteRow) -> AgentProfile {
+    AgentProfile {
+        id: row.get("id"),
+        name: row.get("name"),
+        codename: row.get("codename"),
+        role: row.get("role"),
+        expertise: row.get("expertise"),
+        personality: row.get("personality"),
+        system_context: row.get("system_context"),
+        model: row.get("model"),
+        avatar_emoji: row.get::<Option<String>, _>("avatar_emoji").unwrap_or_else(|| "🤖".to_string()),
+        color: row.get::<Option<String>, _>("color").unwrap_or_else(|| "#00FF88".to_string()),
+        is_active: row.get::<i32, _>("is_active") != 0,
+        tasks_completed: row.get::<Option<i64>, _>("tasks_completed").unwrap_or(0),
+        tasks_failed: row.get::<Option<i64>, _>("tasks_failed").unwrap_or(0),
+        created_at: parse_datetime(row.get::<Option<String>, _>("created_at")).unwrap_or_else(Utc::now),
+        updated_at: parse_datetime(row.get::<Option<String>, _>("updated_at")).unwrap_or_else(Utc::now),
     }
 }
 
