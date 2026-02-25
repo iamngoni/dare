@@ -2,12 +2,16 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::db::Database;
 use crate::executor::WaveExecutor;
+use crate::message_bus::TaskMessage;
 use crate::models::{Run, RunStatus};
 use crate::planner::Planner;
+use crate::server::DashboardServer;
 
 use super::RunArgs;
 
@@ -20,11 +24,14 @@ pub async fn run(args: RunArgs, config: &Config) -> Result<()> {
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Initialize database
+    // Initialize database (shared Arc for dashboard integration)
     let db_path = config.database_path();
     tracing::info!(path = %db_path.display(), "Connecting to database");
-    let db = Database::connect(&db_path).await?;
+    let db = Arc::new(Database::connect(&db_path).await?);
     db.migrate().await?;
+    
+    // Create broadcast channel for task events (shared with dashboard)
+    let (events_tx, _) = broadcast::channel::<TaskMessage>(100);
 
     // Get or create task graph
     let (run_name, graph) = if let Some(ref description) = args.auto {
@@ -113,9 +120,41 @@ pub async fn run(args: RunArgs, config: &Config) -> Result<()> {
     if let Some(max) = args.max_parallel {
         exec_config.execution.max_parallel_agents = max;
     }
+    
+    // Optionally start dashboard server in background
+    let dashboard_port = config.dashboard.port;
+    if !args.no_dashboard {
+        let dashboard_db = Arc::clone(&db);
+        let dashboard_events_tx = events_tx.clone();
+        let dashboard_config = config.clone();
+        
+        tokio::spawn(async move {
+            let server = DashboardServer::with_shared_state(
+                &dashboard_config,
+                dashboard_port,
+                dashboard_db,
+                dashboard_events_tx,
+            );
+            
+            // Give server a moment to start, then open browser
+            if dashboard_config.dashboard.open_browser {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let url = format!("http://localhost:{}", dashboard_port);
+                    let _ = open::that(&url);
+                });
+            }
+            
+            if let Err(e) = server.run().await {
+                tracing::warn!(error = %e, "Dashboard server error");
+            }
+        });
+        
+        println!("🌐 Dashboard: http://localhost:{}", dashboard_port);
+    }
 
-    // Execute waves
-    let executor = WaveExecutor::new(&exec_config, &db);
+    // Execute waves with event broadcasting
+    let executor = WaveExecutor::with_events(&exec_config, &db, events_tx);
     let result = executor.execute(&run, &graph).await;
 
     match result {

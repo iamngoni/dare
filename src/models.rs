@@ -138,3 +138,91 @@ pub struct AgentLog {
     pub message: String,
     pub created_at: DateTime<Utc>,
 }
+
+/// Unique identifier for a todo item
+pub type TodoId = String;
+
+/// A todo item for tracking work items in the API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: TodoId,
+    pub title: String,
+    pub description: Option<String>,
+    pub completed: bool,
+    pub priority: TodoPriority,
+    pub due_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Todo {
+    pub fn new(title: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            description: None,
+            completed: false,
+            priority: TodoPriority::Medium,
+            due_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: TodoPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_due_at(mut self, due_at: DateTime<Utc>) -> Self {
+        self.due_at = Some(due_at);
+        self
+    }
+
+    pub fn mark_completed(&mut self) {
+        self.completed = true;
+        self.completed_at = Some(Utc::now());
+        self.updated_at = Utc::now();
+    }
+
+    pub fn mark_incomplete(&mut self) {
+        self.completed = false;
+        self.completed_at = None;
+        self.updated_at = Utc::now();
+    }
+}
+
+/// Priority level for todo items
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TodoPriority {
+    Low,
+    Medium,
+    High,
+    Urgent,
+}
+
+impl Default for TodoPriority {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl std::fmt::Display for TodoPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TodoPriority::Low => write!(f, "low"),
+            TodoPriority::Medium => write!(f, "medium"),
+            TodoPriority::High => write!(f, "high"),
+            TodoPriority::Urgent => write!(f, "urgent"),
+        }
+    }
+}

@@ -3,15 +3,17 @@
 //! Dare (Shona: "council") transforms complex tasks into coordinated agent swarms.
 
 mod cli;
-mod config;
-mod dag;
-mod db;
-mod executor;
-mod gateway;
-mod message_bus;
-mod models;
-mod planner;
-mod server;
+
+// Re-export library modules for use by the cli module
+pub use dare::config;
+pub use dare::dag;
+pub use dare::db;
+pub use dare::executor;
+pub use dare::gateway;
+pub use dare::message_bus;
+pub use dare::models;
+pub use dare::planner;
+pub use dare::server;
 
 use anyhow::Result;
 use clap::Parser;

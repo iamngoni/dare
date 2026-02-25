@@ -6,14 +6,16 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
 use crate::dag::{TaskGraph, TaskNode};
 use crate::db::Database;
 use crate::gateway::{GatewayClient, GatewayConfig, GatewayEvent, SessionState};
-use crate::models::{Run, RunStatus, TaskId};
+use crate::message_bus::TaskMessage;
+use crate::models::{Run, RunStatus, TaskId, TaskStatus};
 
 /// Result bus for inter-task data passing
 pub struct ResultBus {
@@ -104,14 +106,36 @@ struct ActiveTask {
 }
 
 /// Executes task graphs in parallel waves using cron-based spawning
-pub struct WaveExecutor<'a> {
-    config: &'a Config,
-    db: &'a Database,
+pub struct WaveExecutor {
+    config: Config,
+    db: Arc<Database>,
+    /// Optional broadcast channel for sending task events to dashboard
+    events_tx: Option<broadcast::Sender<TaskMessage>>,
 }
 
-impl<'a> WaveExecutor<'a> {
-    pub fn new(config: &'a Config, db: &'a Database) -> Self {
-        Self { config, db }
+impl WaveExecutor {
+    pub fn new(config: &Config, db: &Arc<Database>) -> Self {
+        Self { 
+            config: config.clone(), 
+            db: Arc::clone(db), 
+            events_tx: None 
+        }
+    }
+
+    /// Create executor with event broadcasting for dashboard integration
+    pub fn with_events(config: &Config, db: &Arc<Database>, events_tx: broadcast::Sender<TaskMessage>) -> Self {
+        Self { 
+            config: config.clone(), 
+            db: Arc::clone(db), 
+            events_tx: Some(events_tx) 
+        }
+    }
+
+    /// Publish a task event to dashboard listeners
+    fn publish_event(&self, msg: TaskMessage) {
+        if let Some(ref tx) = self.events_tx {
+            let _ = tx.send(msg);
+        }
     }
 
     /// Execute the entire task graph
@@ -212,6 +236,10 @@ impl<'a> WaveExecutor<'a> {
         let mut pending: Vec<&TaskNode> = tasks.to_vec();
         let mut completed: Vec<TaskId> = Vec::new();
         let mut failed: Vec<(TaskId, String)> = Vec::new();
+        
+        // Track when tasks were spawned for polling fallback
+        let mut spawn_times: HashMap<String, tokio::time::Instant> = HashMap::new();
+        let poll_fallback_interval = Duration::from_secs(30); // Poll every 30s after spawn
 
         // Main execution loop with timeout
         let deadline = tokio::time::Instant::now() + wave_timeout;
@@ -251,10 +279,23 @@ impl<'a> WaveExecutor<'a> {
                     match gateway.spawn_task(&task.id, &label, &context).await {
                         Ok(job_id) => {
                             println!("  ⏳ {} (spawned: {})", task.id, &job_id[..20.min(job_id.len())]);
+                            tracing::info!(task_id = %task.id, job_id = %job_id, "Task spawned");
+                            
+                            // *** UPDATE DATABASE: Task spawned ***
+                            if let Err(e) = self.db.update_task_session(&task.id, &job_id).await {
+                                tracing::warn!(task_id = %task.id, error = %e, "Failed to update task session in DB");
+                            }
+                            
+                            // *** PUBLISH EVENT: Task spawned ***
+                            self.publish_event(TaskMessage::Spawned {
+                                task_id: task.id.clone(),
+                                session_key: job_id.clone(),
+                            });
                             
                             // Claim files
                             file_tracker.claim(task);
                             active_task_ids.insert(task.id.clone());
+                            spawn_times.insert(job_id.clone(), tokio::time::Instant::now());
                             
                             active.insert(
                                 job_id.clone(),
@@ -267,6 +308,19 @@ impl<'a> WaveExecutor<'a> {
                         }
                         Err(e) => {
                             println!("  ✗ {} (spawn failed: {})", task.id, e);
+                            tracing::error!(task_id = %task.id, error = %e, "Task spawn failed");
+                            
+                            // *** UPDATE DATABASE: Task failed ***
+                            if let Err(db_err) = self.db.update_task_error(&task.id, &e.to_string()).await {
+                                tracing::warn!(task_id = %task.id, error = %db_err, "Failed to update task error in DB");
+                            }
+                            
+                            // *** PUBLISH EVENT: Task failed ***
+                            self.publish_event(TaskMessage::Failed {
+                                task_id: task.id.clone(),
+                                error: e.to_string(),
+                            });
+                            
                             failed.push((task.id.clone(), e.to_string()));
                             // Note: task stays in spawned_task_ids to prevent retry
                         }
@@ -289,13 +343,25 @@ impl<'a> WaveExecutor<'a> {
                 // Clean up remaining jobs
                 for (job_id, task) in &active {
                     let _ = gateway.remove_job(job_id).await;
+                    
+                    // *** UPDATE DATABASE: Task timed out ***
+                    if let Err(e) = self.db.update_task_error(&task.task_id, "Timed out").await {
+                        tracing::warn!(task_id = %task.task_id, error = %e, "Failed to update task timeout in DB");
+                    }
+                    
+                    // *** PUBLISH EVENT: Task failed ***
+                    self.publish_event(TaskMessage::Failed {
+                        task_id: task.task_id.clone(),
+                        error: "Timed out".to_string(),
+                    });
+                    
                     failed.push((task.task_id.clone(), "Timed out".to_string()));
                 }
                 break;
             }
 
-            // Wait for events with timeout
-            let wait_timeout = deadline - tokio::time::Instant::now();
+            // Wait for events with a shorter timeout to allow periodic polling
+            let wait_timeout = Duration::from_secs(5).min(deadline - tokio::time::Instant::now());
             match tokio::time::timeout(wait_timeout, event_rx.recv()).await {
                 Ok(Some(event)) => {
                     match event {
@@ -309,6 +375,17 @@ impl<'a> WaveExecutor<'a> {
                                 task.session_key = Some(session_key.clone());
                                 session_to_job.insert(session_key.clone(), job_id.clone());
                                 println!("  🔄 {} (running: {}...)", task.task_id, &session_key[..20.min(session_key.len())]);
+                                tracing::info!(task_id = %task.task_id, session_key = %session_key, "Task now running");
+                                
+                                // *** UPDATE DATABASE: Task executing ***
+                                if let Err(e) = self.db.update_task_status(&task.task_id, TaskStatus::Executing).await {
+                                    tracing::warn!(task_id = %task.task_id, error = %e, "Failed to update task status in DB");
+                                }
+                                
+                                // *** PUBLISH EVENT: Task running ***
+                                self.publish_event(TaskMessage::Running {
+                                    task_id: task.task_id.clone(),
+                                });
                             }
                         }
                         GatewayEvent::SessionStateChanged { session_key, state } => {
@@ -354,12 +431,23 @@ impl<'a> WaveExecutor<'a> {
                                     // Release files
                                     file_tracker.release(&task.task_id);
                                     active_task_ids.remove(&task.task_id);
+                                    spawn_times.remove(&job_id);
+                                    
+                                    let summary = format!("Task {} completed successfully", task.task_id);
                                     
                                     // Store result
-                                    result_bus.store(
-                                        task.task_id.clone(),
-                                        format!("Task {} completed successfully", task.task_id),
-                                    );
+                                    result_bus.store(task.task_id.clone(), summary.clone());
+                                    
+                                    // *** UPDATE DATABASE: Task completed ***
+                                    if let Err(e) = self.db.update_task_result(&task.task_id, &summary).await {
+                                        tracing::warn!(task_id = %task.task_id, error = %e, "Failed to update task result in DB");
+                                    }
+                                    
+                                    // *** PUBLISH EVENT: Task completed ***
+                                    self.publish_event(TaskMessage::Completed {
+                                        task_id: task.task_id.clone(),
+                                        summary: summary.clone(),
+                                    });
                                     
                                     // Clean up cron job
                                     let _ = gateway.remove_job(&job_id).await;
@@ -397,6 +485,18 @@ impl<'a> WaveExecutor<'a> {
                                     
                                     file_tracker.release(&task.task_id);
                                     active_task_ids.remove(&task.task_id);
+                                    spawn_times.remove(&job_id);
+                                    
+                                    // *** UPDATE DATABASE: Task failed ***
+                                    if let Err(e) = self.db.update_task_error(&task.task_id, &error).await {
+                                        tracing::warn!(task_id = %task.task_id, error = %e, "Failed to update task error in DB");
+                                    }
+                                    
+                                    // *** PUBLISH EVENT: Task failed ***
+                                    self.publish_event(TaskMessage::Failed {
+                                        task_id: task.task_id.clone(),
+                                        error: error.clone(),
+                                    });
                                     
                                     let _ = gateway.remove_job(&job_id).await;
                                     failed.push((task.task_id, error));
@@ -413,17 +513,42 @@ impl<'a> WaveExecutor<'a> {
                     break;
                 }
                 Err(_) => {
-                    // Timeout - poll task states directly
+                    // Short timeout - check if any tasks need polling
+                    let now = tokio::time::Instant::now();
+                    let mut to_poll: Vec<String> = Vec::new();
+                    
+                    for (job_id, spawn_time) in &spawn_times {
+                        if now.duration_since(*spawn_time) >= poll_fallback_interval {
+                            to_poll.push(job_id.clone());
+                        }
+                    }
+                    
+                    // Poll task states for tasks that have been running long enough
+                    if !to_poll.is_empty() {
+                        tracing::debug!(count = to_poll.len(), "Polling task states as fallback");
+                        
+                        // Also try listing sessions to see what's active
+                        if let Ok(sessions) = gateway.list_sessions().await {
+                            tracing::debug!(sessions = %sessions, "Active sessions from gateway");
+                        }
+                    }
+                    
                     let mut to_complete = Vec::new();
                     
-                    for (job_id, task) in active.iter() {
-                        if let Some(state) = gateway.get_task_state(job_id).await {
+                    for job_id in to_poll {
+                        if let Some(state) = gateway.get_task_state(&job_id).await {
                             match state {
                                 SessionState::Completed => {
-                                    to_complete.push((job_id.clone(), task.task_id.clone(), None));
+                                    if let Some(task) = active.get(&job_id) {
+                                        tracing::info!(task_id = %task.task_id, job_id = %job_id, "Task completed (detected via polling)");
+                                        to_complete.push((job_id.clone(), task.task_id.clone(), None));
+                                    }
                                 }
                                 SessionState::Failed(e) => {
-                                    to_complete.push((job_id.clone(), task.task_id.clone(), Some(e)));
+                                    if let Some(task) = active.get(&job_id) {
+                                        tracing::info!(task_id = %task.task_id, job_id = %job_id, error = %e, "Task failed (detected via polling)");
+                                        to_complete.push((job_id.clone(), task.task_id.clone(), Some(e)));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -432,18 +557,46 @@ impl<'a> WaveExecutor<'a> {
                     
                     // Process completions found via polling
                     for (job_id, task_id, error) in to_complete {
-                        if let Some(task) = active.remove(&job_id) {
+                        if let Some(_task) = active.remove(&job_id) {
                             if let Some(e) = error {
                                 println!("  ✗ {} (failed: {})", task_id, e);
                                 file_tracker.release(&task_id);
                                 active_task_ids.remove(&task_id);
+                                spawn_times.remove(&job_id);
+                                
+                                // *** UPDATE DATABASE: Task failed ***
+                                if let Err(db_err) = self.db.update_task_error(&task_id, &e).await {
+                                    tracing::warn!(task_id = %task_id, error = %db_err, "Failed to update task error in DB");
+                                }
+                                
+                                // *** PUBLISH EVENT: Task failed ***
+                                self.publish_event(TaskMessage::Failed {
+                                    task_id: task_id.clone(),
+                                    error: e.clone(),
+                                });
+                                
                                 let _ = gateway.remove_job(&job_id).await;
                                 failed.push((task_id, e));
                             } else {
                                 println!("  ✓ {} (completed)", task_id);
                                 file_tracker.release(&task_id);
                                 active_task_ids.remove(&task_id);
-                                result_bus.store(task_id.clone(), format!("Task {} completed", task_id));
+                                spawn_times.remove(&job_id);
+                                
+                                let summary = format!("Task {} completed", task_id);
+                                result_bus.store(task_id.clone(), summary.clone());
+                                
+                                // *** UPDATE DATABASE: Task completed ***
+                                if let Err(db_err) = self.db.update_task_result(&task_id, &summary).await {
+                                    tracing::warn!(task_id = %task_id, error = %db_err, "Failed to update task result in DB");
+                                }
+                                
+                                // *** PUBLISH EVENT: Task completed ***
+                                self.publish_event(TaskMessage::Completed {
+                                    task_id: task_id.clone(),
+                                    summary,
+                                });
+                                
                                 let _ = gateway.remove_job(&job_id).await;
                                 completed.push(task_id);
                             }
