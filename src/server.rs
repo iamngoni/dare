@@ -5,16 +5,16 @@
 //! JetBrains Mono + Space Grotesk, #00FF88 accent, Lucide icons.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
-        Html, IntoResponse,
+        Html, IntoResponse, Redirect,
     },
     routing::{get, post},
-    Json, Router,
+    Form, Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -23,11 +23,12 @@ use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
+use crate::dag::{TaskGraph, TaskNode};
 use crate::db::Database;
+use crate::executor::WaveExecutor;
 use crate::message_bus::TaskMessage;
-use crate::models::{RunStatus, TaskStatus};
+use crate::models::{Run, RunStatus, TaskStatus};
 
-// Load the base HTML template at compile time
 const BASE_HTML: &str = include_str!("../templates/base.html");
 
 /// Dashboard server with shared state for executor integration
@@ -82,11 +83,14 @@ impl DashboardServer {
             tx
         });
 
-        let state = Arc::new(AppState { db, events_tx });
+        let config = self.config.clone();
+        let state = Arc::new(AppState { db, events_tx, config });
 
         let app = Router::new()
             // Pages
             .route("/", get(page_overview))
+            .route("/history", get(page_history))
+            .route("/agents", get(page_agents))
             .route("/council/:id", get(page_council))
             .route("/tasks/:id", get(page_tasks))
             .route("/new", get(page_new_council))
@@ -99,6 +103,10 @@ impl DashboardServer {
             .route("/htmx/feed", get(htmx_feed))
             .route("/htmx/run/:id/waves", get(htmx_waves))
             .route("/htmx/run/:id/messages", get(htmx_messages))
+            
+            // Actions (form submissions)
+            .route("/action/launch", post(action_launch_council))
+            .route("/action/message/:id", post(action_send_message))
             
             // JSON API
             .route("/api/status", get(api_status))
@@ -126,6 +134,7 @@ impl DashboardServer {
 struct AppState {
     db: Arc<Database>,
     events_tx: broadcast::Sender<TaskMessage>,
+    config: Config,
 }
 
 // ===== Template helpers =====
@@ -136,20 +145,23 @@ fn render_page(title: &str, body: &str) -> String {
         .replace("{{BODY}}", body)
 }
 
-fn sidebar(active: &str) -> String {
-    let nav_items = vec![
-        ("layout-dashboard", "OVERVIEW", "/"),
-        ("message-square", "COUNCIL", "#"),
-        ("git-branch", "TASKS", "#"),
-        ("users", "AGENTS", "#"),
-        ("archive", "HISTORY", "#"),
+fn sidebar(active: &str, latest_run_id: Option<&str>) -> String {
+    let council_href = latest_run_id.map(|id| format!("/council/{}", id)).unwrap_or_else(|| "#".to_string());
+    let tasks_href = latest_run_id.map(|id| format!("/run/{}", id)).unwrap_or_else(|| "#".to_string());
+
+    let items = vec![
+        ("layout-dashboard", "OVERVIEW", "/".to_string()),
+        ("message-square", "COUNCIL", council_href),
+        ("git-branch", "TASKS", tasks_href),
+        ("users", "AGENTS", "/agents".to_string()),
+        ("archive", "HISTORY", "/history".to_string()),
     ];
 
     let mut nav_html = String::new();
-    for (icon, label, href) in &nav_items {
+    for (icon, label, href) in &items {
         let active_class = if *label == active.to_uppercase() { " active" } else { "" };
         nav_html.push_str(&format!(
-            r#"<a href="{}" class="nav-item{}"><i data-lucide="{}"></i>{}</a>"#,
+            r##"<a href="{}" class="nav-item{}"><i data-lucide="{}"></i>{}</a>"##,
             href, active_class, icon, label
         ));
     }
@@ -197,93 +209,86 @@ fn badge_html(status: &str) -> String {
     format!(r#"<span class="badge {}">{}</span>"#, class, label)
 }
 
-// ===== Page Handlers =====
+fn time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let dur = chrono::Utc::now().signed_duration_since(dt);
+    if dur.num_days() > 0 { format!("{}d ago", dur.num_days()) }
+    else if dur.num_hours() > 0 { format!("{}h ago", dur.num_hours()) }
+    else if dur.num_minutes() > 0 { format!("{}m ago", dur.num_minutes()) }
+    else { format!("{}s ago", dur.num_seconds()) }
+}
+
+fn elapsed_str(run: &Run) -> String {
+    if let Some(start) = run.started_at {
+        let dur = if let Some(end) = run.completed_at {
+            end.signed_duration_since(start)
+        } else {
+            chrono::Utc::now().signed_duration_since(start)
+        };
+        let mins = dur.num_minutes();
+        let secs = dur.num_seconds() % 60;
+        if mins > 0 { format!("{}m {}s", mins, secs) } else { format!("{}s", secs) }
+    } else {
+        "—".to_string()
+    }
+}
+
+fn agent_role(desc: &str) -> &'static str {
+    let d = desc.to_lowercase();
+    if d.contains("test") { "tester" }
+    else if d.contains("review") { "reviewer" }
+    else if d.contains("plan") || d.contains("spec") || d.contains("schema") { "planner" }
+    else { "coder" }
+}
+
+async fn get_latest_run_id(db: &Database) -> Option<String> {
+    db.get_latest_run().await.ok().flatten().map(|r| r.id)
+}
+
+// ===== Page: Overview (Command Center) =====
 
 async fn page_overview(State(state): State<Arc<AppState>>) -> Html<String> {
     let runs = state.db.list_runs(20).await.unwrap_or_default();
-    let active_runs: Vec<_> = runs.iter().filter(|r| r.status == RunStatus::Running).collect();
-    let completed_runs: Vec<_> = runs.iter().filter(|r| r.status == RunStatus::Completed).collect();
+    let active_count = runs.iter().filter(|r| r.status == RunStatus::Running).count();
+    let latest_id = runs.first().map(|r| r.id.as_str());
 
-    // Count total tasks across all runs
-    let mut total_tasks = 0;
-    let mut completed_tasks = 0;
-    let mut active_agents = 0;
-    for run in &runs {
-        if let Ok(tasks) = state.db.get_tasks(&run.id).await {
-            total_tasks += tasks.len();
-            completed_tasks += tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
-            active_agents += tasks.iter().filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing).count();
-        }
-    }
-    let success_rate = if total_tasks > 0 {
-        format!("{:.1}%", (completed_tasks as f64 / total_tasks as f64) * 100.0)
-    } else {
-        "—".to_string()
-    };
-
-    // Build active councils HTML
+    // Build councils list
     let mut councils_html = String::new();
     if runs.is_empty() {
-        councils_html.push_str(r#"<div style="text-align:center;padding:40px 0;color:var(--c-muted);">
+        councils_html.push_str(r##"<div style="text-align:center;padding:40px 0;color:var(--c-muted);">
             <p>No councils yet</p>
-            <p style="font-size:10px;margin-top:8px;color:#3f3f3f;">Start one with: dare run &lt;task.yaml&gt;</p>
-        </div>"#);
+            <p style="font-size:10px;margin-top:8px;color:#3f3f3f;">
+                <a href="/new" style="color:var(--c-accent);">Launch your first council</a> or use CLI: dare run &lt;task.yaml&gt;
+            </p>
+        </div>"##);
     }
     for run in runs.iter().take(10) {
         let tasks = state.db.get_tasks(&run.id).await.unwrap_or_default();
         let max_wave = tasks.iter().map(|t| t.wave).max().unwrap_or(0) + 1;
         let current_wave = tasks.iter()
             .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing)
-            .map(|t| t.wave + 1)
-            .max()
-            .unwrap_or(0);
+            .map(|t| t.wave + 1).max().unwrap_or(0);
         let running_agents = tasks.iter()
-            .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing)
-            .count();
+            .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing).count();
+        let elapsed = elapsed_str(run);
 
-        let elapsed = if let Some(start) = run.started_at {
-            let dur = if let Some(end) = run.completed_at {
-                end.signed_duration_since(start)
-            } else {
-                chrono::Utc::now().signed_duration_since(start)
-            };
-            let mins = dur.num_minutes();
-            let secs = dur.num_seconds() % 60;
-            if mins > 0 { format!("{}m {}s", mins, secs) } else { format!("{}s", secs) }
-        } else {
-            "—".to_string()
-        };
-
-        let dot_class = match run.status {
-            RunStatus::Running => "active",
-            RunStatus::Failed => "failed",
-            _ => "active",
-        };
-        let run_badge = match run.status {
-            RunStatus::Running => badge_html("building"),
-            RunStatus::Completed => badge_html("done"),
-            RunStatus::Failed => badge_html("failed"),
-            RunStatus::Paused => badge_html("paused"),
-            RunStatus::Pending => badge_html("pending"),
-        };
-
-        let meta = format!("Wave {}/{} • {} agents • {} elapsed", 
-            current_wave, max_wave, running_agents, elapsed);
+        let dot_class = if run.status == RunStatus::Failed { "failed" } else { "active" };
+        let run_badge = badge_html(&format!("{:?}", run.status).to_lowercase());
+        let meta = format!("Wave {}/{} · {} agents · {}", current_wave, max_wave, running_agents, elapsed);
 
         councils_html.push_str(&format!(
-            r#"<a href="/run/{}" class="council-row">
+            r##"<a href="/council/{}" class="council-row">
                 <div class="council-dot {}"></div>
                 <div class="council-info">
                     <span class="council-name">{}</span>
                     <span class="council-meta">{}</span>
                 </div>
                 {}
-            </a>"#,
+            </a>"##,
             run.id, dot_class, run.name, meta, run_badge
         ));
     }
 
-    // Build feed HTML
+    // Build feed
     let mut feed_html = String::new();
     for run in runs.iter().take(3) {
         if let Ok(tasks) = state.db.get_tasks(&run.id).await {
@@ -295,27 +300,20 @@ async fn page_overview(State(state): State<Arc<AppState>>) -> Html<String> {
                     TaskStatus::Executing => ("", format!("{} executing for {}", task.id, run.name)),
                     _ => ("", format!("{} pending", task.id)),
                 };
-                let time_ago = if let Some(t) = task.completed_at.or(task.started_at) {
-                    let dur = chrono::Utc::now().signed_duration_since(t);
-                    if dur.num_hours() > 0 { format!("{}h ago", dur.num_hours()) }
-                    else if dur.num_minutes() > 0 { format!("{}m ago", dur.num_minutes()) }
-                    else { format!("{}s ago", dur.num_seconds()) }
-                } else {
-                    "—".to_string()
-                };
+                let ta = task.completed_at.or(task.started_at).map(time_ago).unwrap_or_else(|| "—".to_string());
                 feed_html.push_str(&format!(
-                    r#"<div class="feed-item"><span class="feed-text {}">{}</span><span class="feed-time">{}</span></div>"#,
-                    class, text, time_ago
+                    r##"<div class="feed-item"><span class="feed-text {}">{}</span><span class="feed-time">{}</span></div>"##,
+                    class, text, ta
                 ));
             }
         }
     }
     if feed_html.is_empty() {
-        feed_html = r#"<div class="feed-item"><span class="feed-text" style="color:#3f3f3f;">No activity yet</span></div>"#.to_string();
+        feed_html = r##"<div class="feed-item"><span class="feed-text" style="color:#3f3f3f;">No activity yet</span></div>"##.to_string();
     }
 
     let body = format!(
-        r#"{}
+        r##"{}
     <div class="main-content" hx-ext="sse" sse-connect="/events">
         <div class="header-row">
             <div>
@@ -360,10 +358,7 @@ async fn page_overview(State(state): State<Arc<AppState>>) -> Html<String> {
                 <div class="panel" style="flex:1;">
                     <div class="panel-header">
                         <span class="panel-title">ACTIVITY FEED</span>
-                        <div class="chat-live">
-                            <div class="chat-live-dot live-dot"></div>
-                            <span class="chat-live-text">LIVE</span>
-                        </div>
+                        <div class="chat-live"><div class="chat-live-dot live-dot"></div><span class="chat-live-text">LIVE</span></div>
                     </div>
                     <div id="feed-list" style="display:flex;flex-direction:column;gap:12px;"
                          sse-swap="spawned,running,completed,failed" hx-swap="afterbegin">
@@ -372,16 +367,329 @@ async fn page_overview(State(state): State<Arc<AppState>>) -> Html<String> {
                 </div>
             </div>
         </div>
-    </div>"#,
-        sidebar("overview"),
-        active_runs.len(),
-        active_runs.len(),
+    </div>"##,
+        sidebar("overview", latest_id),
+        active_count,
+        active_count,
         councils_html,
         feed_html
     );
 
     Html(render_page("Command Center", &body))
 }
+
+// ===== Page: History =====
+
+async fn page_history(State(state): State<Arc<AppState>>) -> Html<String> {
+    let runs = state.db.list_runs(100).await.unwrap_or_default();
+    let latest_id = get_latest_run_id(&state.db).await;
+
+    let mut rows_html = String::new();
+    for run in &runs {
+        let tasks = state.db.get_tasks(&run.id).await.unwrap_or_default();
+        let completed = tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
+        let total = tasks.len();
+        let max_wave = tasks.iter().map(|t| t.wave).max().unwrap_or(0) + 1;
+        let elapsed = elapsed_str(run);
+        let run_badge = badge_html(&format!("{:?}", run.status).to_lowercase());
+        let created = run.created_at.format("%Y-%m-%d %H:%M").to_string();
+
+        rows_html.push_str(&format!(
+            r##"<a href="/council/{}" class="council-row">
+                <div class="council-info" style="flex:2;">
+                    <span class="council-name">{}</span>
+                    <span class="council-meta">{}</span>
+                </div>
+                <span style="flex:1;font-size:10px;color:var(--c-muted);">{} waves · {}/{} tasks</span>
+                <span style="flex:1;font-size:10px;color:var(--c-muted);">{}</span>
+                {}
+            </a>"##,
+            run.id, run.name, created, max_wave, completed, total, elapsed, run_badge
+        ));
+    }
+
+    if rows_html.is_empty() {
+        rows_html = r##"<div style="text-align:center;padding:60px 0;color:#3f3f3f;">
+            <p>No runs yet</p>
+            <p style="font-size:10px;margin-top:8px;"><a href="/new" style="color:var(--c-accent);">Launch your first council</a></p>
+        </div>"##.to_string();
+    }
+
+    let body = format!(
+        r##"{}
+    <div class="main-content">
+        <div class="header-row">
+            <div>
+                <h1 class="header-title">History</h1>
+                <div class="header-sub">// ALL COUNCIL RUNS</div>
+            </div>
+            <div class="header-right">
+                <a href="/new" class="btn-primary">
+                    <i data-lucide="plus" style="width:14px;height:14px;"></i>
+                    NEW COUNCIL
+                </a>
+            </div>
+        </div>
+
+        <div class="panel" style="flex:1;">
+            <div class="panel-header">
+                <span class="panel-title">RUNS</span>
+                <span class="panel-count">{} total</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                {}
+            </div>
+        </div>
+    </div>"##,
+        sidebar("history", latest_id.as_deref()),
+        runs.len(),
+        rows_html
+    );
+
+    Html(render_page("History", &body))
+}
+
+// ===== Page: Agents =====
+
+async fn page_agents(State(state): State<Arc<AppState>>) -> Html<String> {
+    let runs = state.db.list_runs(20).await.unwrap_or_default();
+    let latest_id = get_latest_run_id(&state.db).await;
+
+    let mut agents_html = String::new();
+    let mut total_agents = 0;
+    let mut active_agents = 0;
+
+    for run in &runs {
+        if let Ok(tasks) = state.db.get_tasks(&run.id).await {
+            let run_has_active = tasks.iter().any(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing);
+            if !run_has_active && run.status != RunStatus::Running { continue; }
+
+            agents_html.push_str(&format!(
+                r##"<div style="margin-bottom:16px;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                        <span class="panel-title">{}</span>
+                        {}
+                    </div>"##,
+                run.name, badge_html(&format!("{:?}", run.status).to_lowercase())
+            ));
+
+            for task in &tasks {
+                if task.status == TaskStatus::Pending { continue; }
+                total_agents += 1;
+                let is_active = task.status == TaskStatus::Spawned || task.status == TaskStatus::Executing;
+                if is_active { active_agents += 1; }
+
+                let (dot_color, status_text) = match task.status {
+                    TaskStatus::Completed => ("var(--c-accent)", "done"),
+                    TaskStatus::Failed => ("var(--c-danger)", "failed"),
+                    TaskStatus::Spawned => ("var(--c-accent)", "spawned"),
+                    TaskStatus::Executing => ("var(--c-accent)", "building"),
+                    TaskStatus::Pending => ("var(--c-muted)", "idle"),
+                };
+                let role = agent_role(&task.description);
+                let session_info = task.agent_session_id.as_deref()
+                    .map(|s| if s.len() > 12 { format!("{}...", &s[..12]) } else { s.to_string() })
+                    .unwrap_or_else(|| "—".to_string());
+                let timing = if let (Some(s), Some(e)) = (task.started_at, task.completed_at) {
+                    format!("{}s", e.signed_duration_since(s).num_seconds())
+                } else if task.started_at.is_some() {
+                    "running...".to_string()
+                } else {
+                    "—".to_string()
+                };
+
+                agents_html.push_str(&format!(
+                    r##"<div class="council-row" style="gap:16px;">
+                        <div class="agent-dot" style="background:{}"></div>
+                        <div style="flex:2;display:flex;flex-direction:column;gap:2px;">
+                            <span style="font-size:12px;font-weight:600;">{}</span>
+                            <span style="font-size:9px;color:#3f3f3f;">{}</span>
+                        </div>
+                        <span style="flex:1;font-size:10px;color:var(--c-muted);">{}</span>
+                        <span style="flex:1;font-size:10px;color:var(--c-muted);">{}</span>
+                        <span class="badge {}">[{}]</span>
+                    </div>"##,
+                    dot_color, task.id, session_info, role, timing,
+                    if is_active { "badge-active" } else if task.status == TaskStatus::Completed { "badge-done" } else { "badge-failed" },
+                    status_text.to_uppercase()
+                ));
+            }
+
+            agents_html.push_str("</div>");
+        }
+    }
+
+    if agents_html.is_empty() {
+        agents_html = r##"<div style="text-align:center;padding:60px 0;color:#3f3f3f;">
+            <p>No agents have been spawned yet</p>
+            <p style="font-size:10px;margin-top:8px;"><a href="/new" style="color:var(--c-accent);">Launch a council to see agents</a></p>
+        </div>"##.to_string();
+    }
+
+    let body = format!(
+        r##"{}
+    <div class="main-content">
+        <div class="header-row">
+            <div>
+                <h1 class="header-title">Agents</h1>
+                <div class="header-sub">// {} TOTAL · {} ACTIVE</div>
+            </div>
+        </div>
+        <div class="panel" style="flex:1;">
+            {}
+        </div>
+    </div>"##,
+        sidebar("agents", latest_id.as_deref()),
+        total_agents,
+        active_agents,
+        agents_html
+    );
+
+    Html(render_page("Agents", &body))
+}
+
+// ===== Page: Council Chat =====
+
+async fn page_council(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let run = state.db.get_run(&id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let tasks = state.db.get_tasks(&id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Get stored messages
+    let messages = state.db.get_messages(&id, 100).await.unwrap_or_default();
+
+    let max_wave = tasks.iter().map(|t| t.wave).max().unwrap_or(0) + 1;
+    let current_wave = tasks.iter()
+        .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing)
+        .map(|t| t.wave + 1).max().unwrap_or(max_wave);
+    let total_agents = tasks.len();
+    let run_badge = badge_html(&format!("{:?}", run.status).to_lowercase());
+
+    // Build participants
+    let mut participants_html = String::new();
+    for task in &tasks {
+        let role = agent_role(&task.description);
+        let dot_color = match task.status {
+            TaskStatus::Completed => "var(--c-accent)",
+            TaskStatus::Failed => "var(--c-danger)",
+            TaskStatus::Spawned | TaskStatus::Executing => "var(--c-accent)",
+            TaskStatus::Pending => "var(--c-muted)",
+        };
+        participants_html.push_str(&format!(
+            r##"<div class="participant">
+                <div class="participant-dot" style="background:{}"></div>
+                <span class="participant-name">{}</span>
+                <span class="participant-role">{}</span>
+            </div>"##,
+            dot_color, task.id, role
+        ));
+    }
+
+    // Build messages from stored messages + task lifecycle
+    let mut messages_html = build_council_messages(&tasks, &messages);
+    if messages_html.is_empty() {
+        messages_html = r##"<div style="text-align:center;padding:60px 0;color:#3f3f3f;">
+            <p>Council is assembling...</p>
+            <p style="font-size:10px;margin-top:8px;">Messages will appear here as agents communicate</p>
+        </div>"##.to_string();
+    }
+
+    // Recent decisions
+    let mut decisions_html = String::new();
+    for task in tasks.iter().filter(|t| t.status == TaskStatus::Completed).rev().take(3) {
+        let ta = task.completed_at.map(time_ago).unwrap_or_else(|| "—".to_string());
+        decisions_html.push_str(&format!(
+            r##"<div class="decision-card">
+                <span class="decision-text">Completed: {}</span>
+                <span class="decision-by">by {} · {}</span>
+            </div>"##,
+            task.description, task.id, ta
+        ));
+    }
+
+    let is_running = run.status == RunStatus::Running;
+    let input_disabled = if is_running { "" } else { " disabled" };
+    let input_placeholder = if is_running {
+        "Drop a message into the council..."
+    } else {
+        "Council is not active"
+    };
+
+    let body = format!(
+        r##"{}
+    <div class="chat-main" hx-ext="sse" sse-connect="/events">
+        <div class="chat-header">
+            <div class="chat-header-left">
+                <a href="/" style="color:var(--c-muted);font-size:12px;"><i data-lucide="arrow-left" style="width:14px;height:14px;"></i></a>
+                <span class="chat-header-title">{}</span>
+                {}
+            </div>
+            <div class="chat-header-right">
+                <span class="chat-agents">{} AGENTS</span>
+                <div class="chat-live"><div class="chat-live-dot live-dot"></div><span class="chat-live-text">LIVE</span></div>
+                <a href="/run/{}" class="btn-outline">
+                    <i data-lucide="git-branch" style="width:14px;height:14px;"></i>
+                    TASKS
+                </a>
+            </div>
+        </div>
+
+        <div style="display:flex;flex:1;min-height:0;">
+            <div class="messages-area" id="messages-area"
+                 hx-get="/htmx/run/{}/messages" hx-trigger="every 3s" hx-swap="innerHTML">
+                {}
+            </div>
+            <div class="context-panel">
+                <span class="ctx-title">COUNCIL CONTEXT</span>
+                <div class="ctx-info">
+                    <div class="ctx-row"><span class="ctx-label">STATUS</span><span class="ctx-value" style="color:var(--c-accent);">{}</span></div>
+                    <div class="ctx-row"><span class="ctx-label">WAVE</span><span class="ctx-value">{} of {}</span></div>
+                    <div class="ctx-row"><span class="ctx-label">ELAPSED</span><span class="ctx-value">{}</span></div>
+                </div>
+                <div class="ctx-divider"></div>
+                <span class="ctx-title">PARTICIPANTS</span>
+                {}
+                <div class="ctx-divider"></div>
+                <span class="ctx-title">RECENT DECISIONS</span>
+                {}
+            </div>
+        </div>
+
+        <form class="chat-input" hx-post="/action/message/{}" hx-swap="none" hx-on::after-request="this.querySelector('input').value=''">
+            <span class="input-tag">YOU</span>
+            <input type="text" name="message" placeholder="{}"{} autocomplete="off">
+            <button type="submit" class="btn-outline" style="padding:4px 10px;"{}>
+                <i data-lucide="send" style="width:14px;height:14px;"></i>
+            </button>
+        </form>
+    </div>"##,
+        sidebar("council", Some(&id)),
+        run.name,
+        run_badge,
+        total_agents,
+        id, id,
+        messages_html,
+        format!("[{:?}]", run.status).to_uppercase(),
+        current_wave, max_wave,
+        elapsed_str(&run),
+        participants_html,
+        decisions_html,
+        id,
+        input_placeholder,
+        input_disabled,
+        input_disabled
+    );
+
+    Ok(Html(render_page(&format!("Council — {}", run.name), &body)))
+}
+
+// ===== Page: Task Graph =====
 
 async fn page_run(
     State(state): State<Arc<AppState>>,
@@ -395,11 +703,7 @@ async fn page_run(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let max_wave = tasks.iter().map(|t| t.wave).max().unwrap_or(0);
-    let completed = tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
     let total = tasks.len();
-    let running_agents = tasks.iter()
-        .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing)
-        .count();
 
     // Wave progress segments
     let mut wave_progress = String::new();
@@ -410,28 +714,47 @@ async fn page_run(
         wave_progress.push_str(&format!(r#"<div class="wave-progress-seg {}"></div>"#, seg_class));
     }
 
-    // Build wave columns
     let waves_html = build_task_graph_html(&tasks, max_wave);
-
     let run_badge = badge_html(&format!("{:?}", run.status).to_lowercase());
+    let is_running = run.status == RunStatus::Running;
+
+    let action_buttons = if is_running {
+        format!(
+            r##"<button hx-post="/api/runs/{}/pause" hx-swap="none" class="btn-outline" hx-on::after-request="location.reload()">
+                <i data-lucide="pause" style="width:14px;height:14px;"></i> PAUSE
+            </button>
+            <button hx-post="/api/runs/{}/kill" hx-swap="none" class="btn-outline" style="border-color:var(--c-danger);color:var(--c-danger);" hx-confirm="Kill this run?" hx-on::after-request="location.reload()">
+                <i data-lucide="x" style="width:14px;height:14px;"></i> KILL
+            </button>"##,
+            id, id
+        )
+    } else if run.status == RunStatus::Paused {
+        format!(
+            r##"<button hx-post="/api/runs/{}/resume" hx-swap="none" class="btn-primary" hx-on::after-request="location.reload()">
+                <i data-lucide="play" style="width:14px;height:14px;"></i> RESUME
+            </button>"##,
+            id
+        )
+    } else {
+        String::new()
+    };
 
     let body = format!(
-        r#"{}
+        r##"{}
     <div class="main-content" hx-ext="sse" sse-connect="/events">
         <div class="header-row">
             <div>
                 <h1 class="header-title">Task Graph</h1>
-                <div class="header-sub">// {} • {} WAVES • {} TASKS</div>
+                <div class="header-sub">// {} · {} WAVES · {} TASKS</div>
             </div>
             <div class="header-right">
                 <a href="/" class="btn-outline">
-                    <i data-lucide="arrow-left" style="width:14px;height:14px;"></i>
-                    BACK
+                    <i data-lucide="arrow-left" style="width:14px;height:14px;"></i> BACK
                 </a>
                 <a href="/council/{}" class="btn-outline">
-                    <i data-lucide="message-square" style="width:14px;height:14px;"></i>
-                    COUNCIL
+                    <i data-lucide="message-square" style="width:14px;height:14px;"></i> COUNCIL
                 </a>
+                {}
                 {}
             </div>
         </div>
@@ -442,13 +765,14 @@ async fn page_run(
              class="waves-row" style="flex:1;">
             {}
         </div>
-    </div>"#,
-        sidebar("tasks"),
+    </div>"##,
+        sidebar("tasks", Some(&id)),
         run.name.to_uppercase(),
         max_wave + 1,
         total,
         id,
         run_badge,
+        action_buttons,
         wave_progress,
         id,
         waves_html
@@ -457,317 +781,227 @@ async fn page_run(
     Ok(Html(render_page(&format!("Tasks — {}", run.name), &body)))
 }
 
-async fn page_council(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Html<String>, StatusCode> {
-    let run = state.db.get_run(&id).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let tasks = state.db.get_tasks(&id).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let max_wave = tasks.iter().map(|t| t.wave).max().unwrap_or(0) + 1;
-    let current_wave = tasks.iter()
-        .filter(|t| t.status == TaskStatus::Spawned || t.status == TaskStatus::Executing)
-        .map(|t| t.wave + 1)
-        .max()
-        .unwrap_or(max_wave);
-    let total_agents = tasks.len();
-    let total_messages = tasks.iter()
-        .filter(|t| t.status != TaskStatus::Pending)
-        .count() * 3; // Estimate ~3 messages per active task
-
-    let run_badge = badge_html(&format!("{:?}", run.status).to_lowercase());
-
-    // Build participants list
-    let mut participants_html = String::new();
-    for (i, task) in tasks.iter().enumerate() {
-        let role = if i == 0 { "planner" } else if task.description.to_lowercase().contains("test") { "testing" }
-            else if task.description.to_lowercase().contains("review") { "code review" }
-            else { "implementation" };
-        let dot_color = match task.status {
-            TaskStatus::Completed => "var(--c-accent)",
-            TaskStatus::Failed => "var(--c-danger)",
-            TaskStatus::Spawned | TaskStatus::Executing => "var(--c-accent)",
-            TaskStatus::Pending => "var(--c-muted)",
-        };
-        let name_color = if task.status == TaskStatus::Spawned || task.status == TaskStatus::Executing {
-            "var(--c-accent)"
-        } else {
-            "var(--c-text)"
-        };
-        participants_html.push_str(&format!(
-            r#"<div class="participant">
-                <div class="participant-dot" style="background:{}"></div>
-                <span class="participant-name" style="color:{}">{}</span>
-                <span class="participant-role">{}</span>
-            </div>"#,
-            dot_color, name_color, task.id, role
-        ));
-    }
-
-    // Build messages from task lifecycle
-    let mut messages_html = String::new();
-    for task in &tasks {
-        if task.status == TaskStatus::Pending { continue; }
-        
-        // Spawned message
-        let avatar_class = if task.description.to_lowercase().contains("test") { "tester" }
-            else if task.description.to_lowercase().contains("review") { "reviewer" }
-            else { "coder" };
-        let name_class = avatar_class;
-        let initials = task.id.chars().take(2).collect::<String>().to_uppercase();
-
-        let time_str = task.started_at
-            .map(|t| t.format("%H:%M").to_string())
-            .unwrap_or_else(|| "—".to_string());
-
-        messages_html.push_str(&format!(
-            r#"<div class="msg">
-                <div class="msg-avatar {}">{}</div>
-                <div class="msg-body">
-                    <div class="msg-header">
-                        <span class="msg-name {}">{}</span>
-                        <span class="msg-time">{}</span>
-                    </div>
-                    <div class="msg-text">Picking up task: {}</div>
-                </div>
-            </div>"#,
-            avatar_class, initials, name_class, task.id, time_str, task.description
-        ));
-
-        // Completion message
-        if task.status == TaskStatus::Completed {
-            let end_time = task.completed_at
-                .map(|t| t.format("%H:%M").to_string())
-                .unwrap_or_else(|| "—".to_string());
-            let duration = if let (Some(s), Some(e)) = (task.started_at, task.completed_at) {
-                let d = e.signed_duration_since(s);
-                format!(" ({}s)", d.num_seconds())
-            } else {
-                String::new()
-            };
-            messages_html.push_str(&format!(
-                r#"<div class="msg">
-                    <div class="msg-avatar {}">{}</div>
-                    <div class="msg-body">
-                        <div class="msg-header">
-                            <span class="msg-name {}">{}</span>
-                            <span class="msg-time">{}</span>
-                            <span class="msg-tag decision">DONE</span>
-                        </div>
-                        <div class="msg-text">Task completed{}</div>
-                    </div>
-                </div>"#,
-                avatar_class, initials, name_class, task.id, end_time, duration
-            ));
-        }
-
-        // Failed message
-        if task.status == TaskStatus::Failed {
-            let err = task.error.as_deref().unwrap_or("Unknown error");
-            messages_html.push_str(&format!(
-                r#"<div class="msg">
-                    <div class="msg-avatar reviewer">{}</div>
-                    <div class="msg-body">
-                        <div class="msg-header">
-                            <span class="msg-name reviewer">{}</span>
-                            <span class="msg-tag challenge">FAILED</span>
-                        </div>
-                        <div class="msg-text" style="color:var(--c-danger);">{}</div>
-                    </div>
-                </div>"#,
-                initials, task.id, err
-            ));
-        }
-    }
-
-    if messages_html.is_empty() {
-        messages_html = r#"<div style="text-align:center;padding:60px 0;color:#3f3f3f;">
-            <p>Council is assembling...</p>
-            <p style="font-size:10px;margin-top:8px;">Messages will appear here as agents communicate</p>
-        </div>"#.to_string();
-    }
-
-    // Recent decisions
-    let mut decisions_html = String::new();
-    for task in tasks.iter().filter(|t| t.status == TaskStatus::Completed).rev().take(3) {
-        let time_ago = task.completed_at.map(|t| {
-            let d = chrono::Utc::now().signed_duration_since(t);
-            if d.num_minutes() > 0 { format!("{}m ago", d.num_minutes()) } else { format!("{}s ago", d.num_seconds()) }
-        }).unwrap_or_else(|| "—".to_string());
-        decisions_html.push_str(&format!(
-            r#"<div class="decision-card">
-                <span class="decision-text">Completed: {}</span>
-                <span class="decision-by">by {} • {}</span>
-            </div>"#,
-            task.description, task.id, time_ago
-        ));
-    }
-
-    let body = format!(
-        r#"{}
-    <div class="chat-main" hx-ext="sse" sse-connect="/events">
-        <div class="chat-header">
-            <div class="chat-header-left">
-                <span class="chat-header-title">{}</span>
-                {}
-            </div>
-            <div class="chat-header-right">
-                <span class="chat-agents">{} AGENTS</span>
-                <div class="chat-live">
-                    <div class="chat-live-dot live-dot"></div>
-                    <span class="chat-live-text">LIVE</span>
-                </div>
-                <a href="/tasks/{}" class="btn-outline">
-                    <i data-lucide="git-branch" style="width:14px;height:14px;"></i>
-                    TASKS
-                </a>
-            </div>
-        </div>
-
-        <div style="display:flex;flex:1;min-height:0;">
-            <div class="messages-area" id="messages-area"
-                 hx-get="/htmx/run/{}/messages" hx-trigger="every 5s" hx-swap="innerHTML">
-                {}
-            </div>
-            <div class="context-panel">
-                <span class="ctx-title">COUNCIL CONTEXT</span>
-                <div class="ctx-info">
-                    <div class="ctx-row"><span class="ctx-label">STATUS</span><span class="ctx-value" style="color:var(--c-accent);">{}</span></div>
-                    <div class="ctx-row"><span class="ctx-label">WAVE</span><span class="ctx-value">{} of {}</span></div>
-                    <div class="ctx-row"><span class="ctx-label">MESSAGES</span><span class="ctx-value">{}</span></div>
-                </div>
-                <div class="ctx-divider"></div>
-                <span class="ctx-title">PARTICIPANTS</span>
-                {}
-                <div class="ctx-divider"></div>
-                <span class="ctx-title">RECENT DECISIONS</span>
-                {}
-            </div>
-        </div>
-
-        <div class="chat-input">
-            <span class="input-tag">YOU</span>
-            <input type="text" placeholder="Drop a message into the council..." disabled>
-        </div>
-    </div>"#,
-        sidebar("council"),
-        run.name,
-        run_badge,
-        total_agents,
-        id,
-        id,
-        messages_html,
-        format!("[{:?}]", run.status).to_uppercase(),
-        current_wave,
-        max_wave,
-        total_messages,
-        participants_html,
-        decisions_html
-    );
-
-    Ok(Html(render_page(&format!("Council — {}", run.name), &body)))
-}
-
 async fn page_tasks(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    // Redirect to /run/:id which shows the task graph
     page_run(State(state), Path(id)).await
 }
 
-async fn page_new_council() -> Html<String> {
+// ===== Page: New Council =====
+
+async fn page_new_council(State(state): State<Arc<AppState>>) -> Html<String> {
+    let latest_id = get_latest_run_id(&state.db).await;
+
     let body = format!(
-        r#"<div class="top-header">
-        <div class="brand">
-            <div class="brand-dot"></div>
-            <span class="brand-text">dare</span>
-        </div>
-        <a href="/" class="btn-outline">
-            <i data-lucide="arrow-left" style="width:14px;height:14px;"></i>
-            BACK TO DASHBOARD
-        </a>
-    </div>
-    <div style="margin-left:0;" class="main-content">
+        r##"{}
+    <div class="main-content">
         <div class="form-center">
             <div class="form-title-block">
                 <h1 class="form-title">New Council</h1>
                 <div class="form-sub">// DESCRIBE YOUR GOAL AND THE COUNCIL WILL FIGURE OUT THE REST</div>
             </div>
 
-            <div class="form-section">
-                <span class="form-label">GOAL</span>
-                <textarea class="form-textarea" placeholder="Refactor the authentication system to use JWT tokens with&#10;refresh token rotation. Extract middleware to shared module.&#10;Add comprehensive tests."></textarea>
-                <span class="form-hint">PRD, feature spec, or just a sentence. The planner will decompose it.</span>
-            </div>
+            <form hx-post="/action/launch" hx-target="#launch-result" hx-swap="innerHTML" hx-indicator="#launch-spinner">
+                <div class="form-section">
+                    <span class="form-label">GOAL</span>
+                    <textarea class="form-textarea" name="goal" placeholder="Refactor the authentication system to use JWT tokens with&#10;refresh token rotation. Extract middleware to shared module.&#10;Add comprehensive tests." required></textarea>
+                    <span class="form-hint">PRD, feature spec, or just a sentence. The planner will decompose it.</span>
+                </div>
 
-            <div class="form-row">
-                <div class="form-field">
-                    <span class="form-label">MODEL</span>
-                    <select class="form-select">
-                        <option>claude-opus-4</option>
-                        <option>claude-sonnet-4</option>
-                        <option>gpt-4o</option>
-                    </select>
+                <div class="form-row" style="margin-top:24px;">
+                    <div class="form-field">
+                        <span class="form-label">MODEL</span>
+                        <select class="form-select" name="model">
+                            <option value="claude-opus-4">claude-opus-4</option>
+                            <option value="claude-sonnet-4" selected>claude-sonnet-4</option>
+                            <option value="gpt-4o">gpt-4o</option>
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <span class="form-label">MAX AGENTS</span>
+                        <select class="form-select" name="max_agents">
+                            <option value="4">4 agents</option>
+                            <option value="6" selected>6 agents</option>
+                            <option value="8">8 agents</option>
+                            <option value="12">12 agents</option>
+                        </select>
+                    </div>
                 </div>
-                <div class="form-field">
-                    <span class="form-label">MAX AGENTS</span>
-                    <select class="form-select">
-                        <option>4 agents</option>
-                        <option>6 agents</option>
-                        <option>8 agents</option>
-                        <option>12 agents</option>
-                    </select>
-                </div>
-            </div>
 
-            <div class="form-section" style="gap:16px;">
-                <span class="form-label">OPTIONS</span>
-                <div class="option-row">
-                    <div class="option-left">
-                        <span class="option-name">Auto-resolve conflicts</span>
-                        <span class="option-desc">Let the orchestrator break deadlocks automatically</span>
+                <div class="form-section" style="gap:16px;margin-top:24px;">
+                    <span class="form-label">OPTIONS</span>
+                    <div class="option-row">
+                        <div class="option-left">
+                            <span class="option-name">Auto-resolve conflicts</span>
+                            <span class="option-desc">Let the orchestrator break deadlocks automatically</span>
+                        </div>
+                        <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');this.querySelector('input').value=this.classList.contains('on')?'true':'false';">
+                            <input type="hidden" name="auto_resolve" value="true">
+                            <div class="toggle-knob"></div>
+                        </div>
                     </div>
-                    <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');">
-                        <div class="toggle-knob"></div>
+                    <div class="option-row">
+                        <div class="option-left">
+                            <span class="option-name">Human approval gates</span>
+                            <span class="option-desc">Pause at wave boundaries for your review</span>
+                        </div>
+                        <div class="toggle off" onclick="this.classList.toggle('on');this.classList.toggle('off');this.querySelector('input').value=this.classList.contains('on')?'true':'false';">
+                            <input type="hidden" name="human_approval" value="false">
+                            <div class="toggle-knob"></div>
+                        </div>
+                    </div>
+                    <div class="option-row">
+                        <div class="option-left">
+                            <span class="option-name">Verbose council logging</span>
+                            <span class="option-desc">Log all inter-agent messages to output</span>
+                        </div>
+                        <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');this.querySelector('input').value=this.classList.contains('on')?'true':'false';">
+                            <input type="hidden" name="verbose" value="true">
+                            <div class="toggle-knob"></div>
+                        </div>
                     </div>
                 </div>
-                <div class="option-row">
-                    <div class="option-left">
-                        <span class="option-name">Human approval gates</span>
-                        <span class="option-desc">Pause at wave boundaries for your review</span>
-                    </div>
-                    <div class="toggle off" onclick="this.classList.toggle('on');this.classList.toggle('off');">
-                        <div class="toggle-knob"></div>
-                    </div>
-                </div>
-                <div class="option-row">
-                    <div class="option-left">
-                        <span class="option-name">Verbose council logging</span>
-                        <span class="option-desc">Log all inter-agent messages to output</span>
-                    </div>
-                    <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');">
-                        <div class="toggle-knob"></div>
-                    </div>
-                </div>
-            </div>
 
-            <div class="launch-row">
-                <span class="launch-info">Estimated: ~6 agents • 3-5 waves</span>
-                <button class="btn-launch" disabled title="Coming soon — use CLI: dare run &lt;task.yaml&gt;">
-                    <i data-lucide="zap" style="width:16px;height:16px;"></i>
-                    LAUNCH COUNCIL
-                </button>
-            </div>
+                <div class="launch-row" style="margin-top:32px;">
+                    <span class="launch-info" id="launch-spinner" style="display:none;">
+                        <span class="live-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--c-accent);"></span>
+                        Planning...
+                    </span>
+                    <span class="launch-info" id="launch-est">Estimated: ~6 agents · 3-5 waves</span>
+                    <button type="submit" class="btn-launch">
+                        <i data-lucide="zap" style="width:16px;height:16px;"></i>
+                        LAUNCH COUNCIL
+                    </button>
+                </div>
+            </form>
+
+            <div id="launch-result" style="margin-top:16px;"></div>
         </div>
-    </div>"#
+    </div>"##,
+        sidebar("overview", latest_id.as_deref())
     );
 
     Html(render_page("New Council", &body))
+}
+
+// ===== Action Handlers =====
+
+#[derive(Deserialize)]
+struct LaunchForm {
+    goal: String,
+    model: Option<String>,
+    max_agents: Option<String>,
+    auto_resolve: Option<String>,
+    human_approval: Option<String>,
+    verbose: Option<String>,
+}
+
+async fn action_launch_council(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<LaunchForm>,
+) -> Html<String> {
+    let goal = form.goal.trim().to_string();
+    if goal.is_empty() {
+        return Html(r##"<div style="color:var(--c-danger);font-size:12px;">Goal cannot be empty</div>"##.to_string());
+    }
+
+    // Use the auto-plan feature to decompose the goal
+    let planner = crate::planner::Planner::new(&state.config);
+    let graph = match planner.auto_plan(&goal).await {
+        Ok(g) => g,
+        Err(e) => {
+            return Html(format!(
+                r##"<div style="color:var(--c-danger);font-size:12px;">Planning failed: {}</div>"##,
+                e
+            ));
+        }
+    };
+
+    let task_count = graph.nodes.len();
+    let waves = graph.compute_waves();
+    let wave_count = waves.len();
+
+    // Create the run
+    let mut run = Run::new(graph.name.as_deref().unwrap_or(&goal[..goal.len().min(60)]));
+    run.description = Some(goal.clone());
+    run.status = RunStatus::Running;
+    run.started_at = Some(chrono::Utc::now());
+
+    if let Err(e) = state.db.create_run(&run).await {
+        return Html(format!(
+            r##"<div style="color:var(--c-danger);font-size:12px;">Failed to create run: {}</div>"##, e
+        ));
+    }
+
+    if let Err(e) = state.db.create_tasks_from_graph(&run.id, &graph).await {
+        return Html(format!(
+            r##"<div style="color:var(--c-danger);font-size:12px;">Failed to create tasks: {}</div>"##, e
+        ));
+    }
+
+    // Spawn executor in background
+    let db = state.db.clone();
+    let config = state.config.clone();
+    let events_tx = state.events_tx.clone();
+    let run_id = run.id.clone();
+    let run_clone = run.clone();
+    let graph_clone = graph.clone();
+    tokio::spawn(async move {
+        let executor = WaveExecutor::with_events(&config, &db, events_tx);
+        match executor.execute(&run_clone, &graph_clone).await {
+            Ok(_) => {
+                let _ = db.update_run_status(&run_id, RunStatus::Completed).await;
+                tracing::info!(run_id = %run_id, "Run completed successfully");
+            }
+            Err(e) => {
+                let _ = db.update_run_status(&run_id, RunStatus::Failed).await;
+                tracing::error!(run_id = %run_id, error = %e, "Run failed");
+            }
+        }
+    });
+
+    // Return redirect to the council page
+    Html(format!(
+        r##"<div style="padding:12px;background:var(--c-accent-soft);border:1px solid var(--c-accent);">
+            <span style="color:var(--c-accent);font-weight:700;font-size:12px;">COUNCIL LAUNCHED</span>
+            <p style="font-size:11px;color:var(--c-muted);margin-top:4px;">{} tasks across {} waves</p>
+            <a href="/council/{}" class="btn-primary" style="margin-top:12px;display:inline-flex;">
+                <i data-lucide="message-square" style="width:14px;height:14px;"></i>
+                OPEN COUNCIL
+            </a>
+        </div>"##,
+        task_count, wave_count, run.id
+    ))
+}
+
+#[derive(Deserialize)]
+struct MessageForm {
+    message: String,
+}
+
+async fn action_send_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<MessageForm>,
+) -> Result<Html<String>, StatusCode> {
+    let msg = form.message.trim().to_string();
+    if msg.is_empty() {
+        return Ok(Html(String::new()));
+    }
+
+    // Store the message
+    let payload = serde_json::json!({
+        "sender": "human",
+        "text": msg,
+    });
+    state.db.insert_message(&id, None, "human", &payload).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // TODO: Forward to active agent sessions via gateway
+    // For now, just store it so it shows up in the chat
+
+    Ok(Html(String::new()))
 }
 
 // ===== HTMX Fragment Handlers =====
@@ -794,8 +1028,8 @@ async fn htmx_stats(State(state): State<Arc<AppState>>) -> Html<String> {
         "—".to_string()
     };
 
-    let html = format!(
-        r#"<div class="metric-card">
+    Html(format!(
+        r##"<div class="metric-card">
             <span class="metric-label">COUNCILS TODAY</span>
             <span class="metric-value">{}</span>
         </div>
@@ -810,15 +1044,12 @@ async fn htmx_stats(State(state): State<Arc<AppState>>) -> Html<String> {
         <div class="metric-card">
             <span class="metric-label">SUCCESS RATE</span>
             <span class="metric-value">{}</span>
-        </div>"#,
+        </div>"##,
         today_count, active_agents, completed_tasks, success_rate
-    );
-
-    Html(html)
+    ))
 }
 
-async fn htmx_councils(State(state): State<Arc<AppState>>) -> Html<String> {
-    // Reuse overview logic — for now return empty
+async fn htmx_councils(State(_state): State<Arc<AppState>>) -> Html<String> {
     Html(String::new())
 }
 
@@ -829,27 +1060,27 @@ async fn htmx_agents(State(state): State<Arc<AppState>>) -> Html<String> {
     for run in &runs {
         if let Ok(tasks) = state.db.get_tasks(&run.id).await {
             for task in tasks.iter().filter(|t| t.status != TaskStatus::Pending) {
-                let (dot_color, status_text, status_color) = match task.status {
-                    TaskStatus::Completed => ("var(--c-accent)", "done", "var(--c-accent)"),
-                    TaskStatus::Failed => ("var(--c-danger)", "failed", "var(--c-danger)"),
-                    TaskStatus::Spawned => ("var(--c-accent)", "spawned", "var(--c-accent)"),
-                    TaskStatus::Executing => ("var(--c-accent)", "building", "var(--c-accent)"),
-                    TaskStatus::Pending => ("var(--c-muted)", "idle", "var(--c-muted)"),
+                let (dot_color, status_text) = match task.status {
+                    TaskStatus::Completed => ("var(--c-accent)", "done"),
+                    TaskStatus::Failed => ("var(--c-danger)", "failed"),
+                    TaskStatus::Spawned => ("var(--c-accent)", "spawned"),
+                    TaskStatus::Executing => ("var(--c-accent)", "building"),
+                    TaskStatus::Pending => ("var(--c-muted)", "idle"),
                 };
                 html.push_str(&format!(
-                    r#"<div class="agent-row">
+                    r##"<div class="agent-row">
                         <div class="agent-dot" style="background:{}"></div>
                         <span class="agent-name">{}</span>
                         <span class="agent-status" style="color:{}">{}</span>
-                    </div>"#,
-                    dot_color, task.id, status_color, status_text
+                    </div>"##,
+                    dot_color, task.id, dot_color, status_text
                 ));
             }
         }
     }
 
     if html.is_empty() {
-        html = r#"<span style="font-size:10px;color:#3f3f3f;">No agents active</span>"#.to_string();
+        html = r##"<span style="font-size:10px;color:#3f3f3f;">No agents active</span>"##.to_string();
     }
 
     Html(html)
@@ -873,55 +1104,121 @@ async fn htmx_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    // Return messages HTML — simplified version of council page messages
     let tasks = state.db.get_tasks(&id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let messages = state.db.get_messages(&id, 100).await.unwrap_or_default();
+    Ok(Html(build_council_messages(&tasks, &messages)))
+}
 
-    let mut html = String::new();
-    for task in &tasks {
+// ===== Message Builders =====
+
+fn build_council_messages(
+    tasks: &[crate::models::Task],
+    stored_messages: &[(i64, Option<String>, String, serde_json::Value, chrono::DateTime<chrono::Utc>)],
+) -> String {
+    // Collect all events into a timeline
+    let mut timeline: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+
+    // Task lifecycle messages
+    for task in tasks {
         if task.status == TaskStatus::Pending { continue; }
-        let avatar_class = if task.description.to_lowercase().contains("test") { "tester" }
-            else if task.description.to_lowercase().contains("review") { "reviewer" }
-            else { "coder" };
+
+        let role = agent_role(&task.description);
         let initials = task.id.chars().take(2).collect::<String>().to_uppercase();
-        let time_str = task.started_at
-            .map(|t| t.format("%H:%M").to_string())
-            .unwrap_or_else(|| "—".to_string());
 
-        html.push_str(&format!(
-            r#"<div class="msg">
-                <div class="msg-avatar {}">{}</div>
-                <div class="msg-body">
-                    <div class="msg-header">
-                        <span class="msg-name {}">{}</span>
-                        <span class="msg-time">{}</span>
-                    </div>
-                    <div class="msg-text">{}</div>
-                </div>
-            </div>"#,
-            avatar_class, initials, avatar_class, task.id, time_str, task.description
-        ));
-
-        if task.status == TaskStatus::Completed {
-            let end_time = task.completed_at.map(|t| t.format("%H:%M").to_string()).unwrap_or_default();
-            html.push_str(&format!(
-                r#"<div class="msg">
+        if let Some(start) = task.started_at {
+            let time_str = start.format("%H:%M").to_string();
+            let html = format!(
+                r##"<div class="msg">
                     <div class="msg-avatar {}">{}</div>
                     <div class="msg-body">
                         <div class="msg-header">
                             <span class="msg-name {}">{}</span>
                             <span class="msg-time">{}</span>
-                            <span class="msg-tag decision">DONE</span>
                         </div>
-                        <div class="msg-text">Task completed</div>
+                        <div class="msg-text">Picking up task: {}</div>
                     </div>
-                </div>"#,
-                avatar_class, initials, avatar_class, task.id, end_time
-            ));
+                </div>"##,
+                role, initials, role, task.id, time_str, task.description
+            );
+            timeline.push((start, html));
+        }
+
+        if task.status == TaskStatus::Completed {
+            if let Some(end) = task.completed_at {
+                let time_str = end.format("%H:%M").to_string();
+                let duration = task.started_at.map(|s| format!(" ({}s)", end.signed_duration_since(s).num_seconds())).unwrap_or_default();
+                let html = format!(
+                    r##"<div class="msg">
+                        <div class="msg-avatar {}">{}</div>
+                        <div class="msg-body">
+                            <div class="msg-header">
+                                <span class="msg-name {}">{}</span>
+                                <span class="msg-time">{}</span>
+                                <span class="msg-tag decision">DONE</span>
+                            </div>
+                            <div class="msg-text">Task completed{}</div>
+                        </div>
+                    </div>"##,
+                    role, initials, role, task.id, time_str, duration
+                );
+                timeline.push((end, html));
+            }
+        }
+
+        if task.status == TaskStatus::Failed {
+            let err = task.error.as_deref().unwrap_or("Unknown error");
+            let time = task.completed_at.or(task.started_at).unwrap_or_else(chrono::Utc::now);
+            let time_str = time.format("%H:%M").to_string();
+            let html = format!(
+                r##"<div class="msg">
+                    <div class="msg-avatar reviewer">{}</div>
+                    <div class="msg-body">
+                        <div class="msg-header">
+                            <span class="msg-name reviewer">{}</span>
+                            <span class="msg-time">{}</span>
+                            <span class="msg-tag challenge">FAILED</span>
+                        </div>
+                        <div class="msg-text" style="color:var(--c-danger);">{}</div>
+                    </div>
+                </div>"##,
+                initials, task.id, time_str, err
+            );
+            timeline.push((time, html));
         }
     }
 
-    Ok(Html(html))
+    // Stored messages (human input, system messages)
+    for (_id, _task_id, msg_type, payload, created_at) in stored_messages.iter().rev() {
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let sender = payload.get("sender").and_then(|v| v.as_str()).unwrap_or("system");
+        let time_str = created_at.format("%H:%M").to_string();
+
+        let (avatar_class, name, tag) = match sender {
+            "human" => ("system", "YOU", r##"<span class="msg-tag decision">HUMAN</span>"##),
+            _ => ("system", "SYSTEM", ""),
+        };
+
+        let html = format!(
+            r##"<div class="msg">
+                <div class="msg-avatar {}" style="background:var(--c-accent-soft);color:var(--c-accent);">▶</div>
+                <div class="msg-body">
+                    <div class="msg-header">
+                        <span class="msg-name" style="color:var(--c-accent);">{}</span>
+                        <span class="msg-time">{}</span>
+                        {}
+                    </div>
+                    <div class="msg-text">{}</div>
+                </div>
+            </div>"##,
+            avatar_class, name, time_str, tag, text
+        );
+        timeline.push((*created_at, html));
+    }
+
+    // Sort by time
+    timeline.sort_by_key(|(t, _)| *t);
+    timeline.into_iter().map(|(_, html)| html).collect::<Vec<_>>().join("\n")
 }
 
 // ===== Task Graph Builder =====
@@ -938,11 +1235,11 @@ fn build_task_graph_html(tasks: &[crate::models::Task], max_wave: usize) -> Stri
         let status_text = if all_done { "[DONE]" } else if any_active { "[ACTIVE]" } else { "[PENDING]" };
 
         html.push_str(&format!(
-            r#"<div class="wave-col">
+            r##"<div class="wave-col">
                 <div class="wave-label">
                     <span class="wave-label-text {}">WAVE {:02}</span>
                     <span class="wave-label-status {}">{}</span>
-                </div>"#,
+                </div>"##,
             label_class, wave_num + 1, label_class, status_text
         ));
 
@@ -950,26 +1247,29 @@ fn build_task_graph_html(tasks: &[crate::models::Task], max_wave: usize) -> Stri
             let (card_class, meta_class) = match task.status {
                 TaskStatus::Completed => ("done", "done"),
                 TaskStatus::Spawned | TaskStatus::Executing => ("active", "active"),
-                TaskStatus::Failed => ("done", "done"), // Use border styling
+                TaskStatus::Failed => ("", ""),
                 TaskStatus::Pending => ("", "waiting"),
             };
 
             let timing = if let (Some(s), Some(e)) = (task.started_at, task.completed_at) {
-                format!("{} • {}s", task.id, e.signed_duration_since(s).num_seconds())
+                format!("{} · {}s", task.id, e.signed_duration_since(s).num_seconds())
             } else if task.started_at.is_some() {
-                format!("{} • in progress", task.id)
+                format!("{} · in progress", task.id)
             } else {
-                format!("{} • waiting", task.id)
+                format!("{} · waiting", task.id)
             };
 
-            let name_class = if task.status == TaskStatus::Pending { r#" class="task-name muted""# } else { r#" class="task-name""# };
+            let name_class = if task.status == TaskStatus::Pending { " muted" } else { "" };
+            let failed_style = if task.status == TaskStatus::Failed {
+                r##" style="border-color:var(--c-danger);""##
+            } else { "" };
 
             html.push_str(&format!(
-                r#"<div class="task-card {}">
-                    <span{}>{}</span>
+                r##"<div class="task-card {}"{}>
+                    <span class="task-name{}">{}</span>
                     <span class="task-meta {}">{}</span>
-                </div>"#,
-                card_class, name_class, task.description, meta_class, timing
+                </div>"##,
+                card_class, failed_style, name_class, task.description, meta_class, timing
             ));
         }
 
@@ -1082,25 +1382,25 @@ async fn sse_handler(
                 TaskMessage::Spawned { task_id, session_key } => {
                     let short = if session_key.len() > 16 { &session_key[..16] } else { session_key };
                     format!(
-                        r#"<div class="feed-item"><span class="feed-text info">{} spawned ({}...)</span><span class="feed-time">{}</span></div>"#,
+                        r##"<div class="feed-item"><span class="feed-text info">{} spawned ({}...)</span><span class="feed-time">{}</span></div>"##,
                         task_id, short, chrono::Local::now().format("%H:%M:%S")
                     )
                 }
                 TaskMessage::Running { task_id } => {
                     format!(
-                        r#"<div class="feed-item"><span class="feed-text">{} executing</span><span class="feed-time">{}</span></div>"#,
+                        r##"<div class="feed-item"><span class="feed-text">{} executing</span><span class="feed-time">{}</span></div>"##,
                         task_id, chrono::Local::now().format("%H:%M:%S")
                     )
                 }
                 TaskMessage::Completed { task_id, summary } => {
                     format!(
-                        r#"<div class="feed-item"><span class="feed-text">{} completed {}</span><span class="feed-time">{}</span></div>"#,
+                        r##"<div class="feed-item"><span class="feed-text">{} completed {}</span><span class="feed-time">{}</span></div>"##,
                         task_id, summary, chrono::Local::now().format("%H:%M:%S")
                     )
                 }
                 TaskMessage::Failed { task_id, error } => {
                     format!(
-                        r#"<div class="feed-item"><span class="feed-text warning">{} failed: {}</span><span class="feed-time">{}</span></div>"#,
+                        r##"<div class="feed-item"><span class="feed-text warning">{} failed: {}</span><span class="feed-time">{}</span></div>"##,
                         task_id, error, chrono::Local::now().format("%H:%M:%S")
                     )
                 }
