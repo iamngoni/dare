@@ -1429,6 +1429,12 @@ fn build_council_messages(
 
         if let Some(start) = task.started_at {
             let time_str = start.format("%H:%M").to_string();
+            // Truncate long descriptions for the chat view
+            let short_desc = if task.description.len() > 200 {
+                format!("{}...", &task.description[..200])
+            } else {
+                task.description.clone()
+            };
             let html = format!(
                 r##"<div class="msg">
                     <div class="msg-avatar {}">{}</div>
@@ -1436,11 +1442,12 @@ fn build_council_messages(
                         <div class="msg-header">
                             <span class="msg-name {}">{}</span>
                             <span class="msg-time">{}</span>
+                            <span class="msg-tag decision">TASK</span>
                         </div>
-                        <div class="msg-text">Picking up task: {}</div>
+                        <div class="msg-text">Picking up: {}</div>
                     </div>
                 </div>"##,
-                role, initials, role, task.id, time_str, task.description
+                role, initials, role, task.id, time_str, short_desc
             );
             timeline.push((start, html));
         }
@@ -1491,7 +1498,12 @@ fn build_council_messages(
 
     // Stored messages (human input, agent chat, system messages)
     for (_id, _task_id, msg_type, payload, created_at) in stored_messages.iter().rev() {
-        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        // HTML-escape and preserve newlines
+        let text = raw_text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         let sender = payload.get("sender").and_then(|v| v.as_str()).unwrap_or("system");
         let tag_value = payload.get("tag").and_then(|v| v.as_str()).unwrap_or("");
         let time_str = created_at.format("%H:%M").to_string();

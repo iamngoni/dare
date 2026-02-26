@@ -255,8 +255,15 @@
         .msg-tag.question { background: #00AAFF20; color: var(--c-info); }
         .msg-text {
             font-size: 12px; color: var(--c-muted); line-height: 1.6;
-            word-break: break-word;
+            word-break: break-word; white-space: pre-wrap;
+            max-height: 120px; overflow: hidden; position: relative;
         }
+        .msg-text.expanded { max-height: none; }
+        .msg-text-toggle {
+            font-size: 10px; color: var(--c-accent); cursor: pointer;
+            margin-top: 4px; display: none;
+        }
+        .msg-text.clamped + .msg-text-toggle { display: block; }
 
         .chat-input {
             height: 56px; border-top: 1px solid var(--c-border);
