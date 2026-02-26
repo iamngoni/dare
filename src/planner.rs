@@ -212,9 +212,10 @@ Output ONLY the YAML, no explanation before or after.
         let mut graph = TaskGraph::new();
         graph.name = Some(description.to_string());
         graph.description = Some("Auto-generated single-task plan".to_string());
+        let prefix = &uuid::Uuid::new_v4().to_string()[..8];
         
         graph.add_task(TaskNode {
-            id: "main".to_string(),
+            id: format!("{}-main", prefix),
             description: description.to_string(),
             depends_on: vec![],
             outputs: vec![],
@@ -231,13 +232,16 @@ Output ONLY the YAML, no explanation before or after.
         let mut graph = TaskGraph::new();
         graph.name = Some(description.to_string());
         
+        // Generate a short unique prefix to avoid task ID collisions across runs
+        let prefix = &uuid::Uuid::new_v4().to_string()[..8];
+        
         let desc_lower = description.to_lowercase();
         
         // Check for common patterns and create appropriate task structure
         if desc_lower.contains("api") || desc_lower.contains("endpoint") || desc_lower.contains("rest") {
             // REST API pattern
             graph.add_task(TaskNode {
-                id: "models".to_string(),
+                id: format!("{}-models", prefix).to_string(),
                 description: format!("Create data models for: {}", description),
                 depends_on: vec![],
                 outputs: vec![PathBuf::from("src/models/")],
@@ -245,24 +249,24 @@ Output ONLY the YAML, no explanation before or after.
             });
             
             graph.add_task(TaskNode {
-                id: "handlers".to_string(),
+                id: format!("{}-handlers", prefix).to_string(),
                 description: format!("Implement API handlers for: {}", description),
-                depends_on: vec!["models".to_string()],
+                depends_on: vec![format!("{}-models", prefix)],
                 outputs: vec![PathBuf::from("src/handlers/")],
                 estimated_complexity: Some(Complexity::Medium),
             });
             
             graph.add_task(TaskNode {
-                id: "routes".to_string(),
+                id: format!("{}-routes", prefix).to_string(),
                 description: "Configure routes and wire up handlers".to_string(),
-                depends_on: vec!["handlers".to_string()],
+                depends_on: vec![format!("{}-handlers", prefix)],
                 outputs: vec![PathBuf::from("src/routes.rs")],
                 estimated_complexity: Some(Complexity::Small),
             });
         } else if desc_lower.contains("database") || desc_lower.contains("migration") {
             // Database pattern
             graph.add_task(TaskNode {
-                id: "migration".to_string(),
+                id: format!("{}-migration", prefix).to_string(),
                 description: format!("Create database migration for: {}", description),
                 depends_on: vec![],
                 outputs: vec![PathBuf::from("migrations/")],
@@ -270,16 +274,16 @@ Output ONLY the YAML, no explanation before or after.
             });
             
             graph.add_task(TaskNode {
-                id: "db_module".to_string(),
+                id: format!("{}-db_module", prefix).to_string(),
                 description: "Implement database access layer".to_string(),
-                depends_on: vec!["migration".to_string()],
+                depends_on: vec![format!("{}-migration", prefix)],
                 outputs: vec![PathBuf::from("src/db.rs")],
                 estimated_complexity: Some(Complexity::Medium),
             });
         } else {
             // Generic single task
             graph.add_task(TaskNode {
-                id: "main".to_string(),
+                id: format!("{}-main", prefix).to_string(),
                 description: description.to_string(),
                 depends_on: vec![],
                 outputs: vec![],
