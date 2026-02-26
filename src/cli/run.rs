@@ -35,14 +35,12 @@ pub async fn run(args: RunArgs, config: &Config) -> Result<()> {
 
     // Get or create task graph
     let (run_name, graph) = if let Some(ref description) = args.auto {
-        // Auto-plan mode
-        println!("\n🧠 Auto-planning: {}", description);
-        let planner = Planner::new(config);
-        let graph = planner.auto_plan(description).await?;
-        let name = graph
-            .name
-            .clone()
-            .unwrap_or_else(|| description.chars().take(50).collect());
+        // Auto-plan mode: two-phase planning (decompose → cast team)
+        println!("\n🧠 Planning: {}", description);
+        let planner = Planner::new(config, &db);
+        let council = planner.plan(description).await?;
+        let graph = planner.to_task_graph(&council)?;
+        let name = council.name.clone();
         (name, graph)
     } else if let Some(ref run_id) = args.continue_run {
         // Continue interrupted run

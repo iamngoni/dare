@@ -84,6 +84,13 @@ impl DashboardServer {
         });
 
         let config = self.config.clone();
+        
+        // Seed default agent profiles
+        let planner = crate::planner::Planner::new(&config, &db);
+        if let Err(e) = planner.seed_default_profiles().await {
+            tracing::warn!(error = %e, "Failed to seed default profiles");
+        }
+        
         let state = Arc::new(AppState { db, events_tx, config });
 
         let app = Router::new()
@@ -917,13 +924,22 @@ async fn action_launch_council(
         return Html(r##"<div style="color:var(--c-danger);font-size:12px;">Goal cannot be empty</div>"##.to_string());
     }
 
-    // Use the auto-plan feature to decompose the goal
-    let planner = crate::planner::Planner::new(&state.config);
-    let graph = match planner.auto_plan(&goal).await {
-        Ok(g) => g,
+    // Two-phase planning: decompose goal → cast team
+    let planner = crate::planner::Planner::new(&state.config, &state.db);
+    let council = match planner.plan(&goal).await {
+        Ok(c) => c,
         Err(e) => {
             return Html(format!(
                 r##"<div style="color:var(--c-danger);font-size:12px;">Planning failed: {}</div>"##,
+                e
+            ));
+        }
+    };
+    let graph = match planner.to_task_graph(&council) {
+        Ok(g) => g,
+        Err(e) => {
+            return Html(format!(
+                r##"<div style="color:var(--c-danger);font-size:12px;">Graph validation failed: {}</div>"##,
                 e
             ));
         }

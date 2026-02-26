@@ -247,10 +247,23 @@ impl Database {
                 if let Some(node) = graph.nodes.get(task_id) {
                     let outputs_json = serde_json::to_string(&node.outputs)?;
                     
+                    // Resolve agent_profile codename to ID if needed
+                    let profile_id = if let Some(ref profile_ref) = node.agent_profile {
+                        // Try as codename first
+                        if let Ok(Some(p)) = self.get_profile_by_codename(profile_ref).await {
+                            Some(p.id)
+                        } else {
+                            // Assume it's already an ID
+                            Some(profile_ref.clone())
+                        }
+                    } else {
+                        None
+                    };
+
                     sqlx::query(
                         r#"
-                        INSERT INTO tasks (id, run_id, description, status, wave, outputs_json, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO tasks (id, run_id, description, status, wave, outputs_json, agent_profile_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         "#,
                     )
                     .bind(task_id)
@@ -259,6 +272,7 @@ impl Database {
                     .bind(TaskStatus::Pending.to_string())
                     .bind(wave_num as i32)
                     .bind(&outputs_json)
+                    .bind(&profile_id)
                     .bind(Utc::now().to_rfc3339())
                     .execute(&self.pool)
                     .await?;
@@ -433,12 +447,14 @@ impl Database {
                 .map(|(_, dep)| dep.clone())
                 .collect();
             
+            // TODO: read agent_profile_id from task row and resolve to codename
             graph.add_task(crate::dag::TaskNode {
                 id: task.id,
                 description: task.description,
                 depends_on: task_deps,
                 outputs: task.outputs,
                 estimated_complexity: None,
+                agent_profile: None, // Will be resolved from DB at execution time
             });
         }
 
@@ -1137,6 +1153,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![PathBuf::from("output.txt")],
             estimated_complexity: None,
+                agent_profile: None,
         });
         graph.add_task(TaskNode {
             id: "task-b".to_string(),
@@ -1144,6 +1161,7 @@ mod tests {
             depends_on: vec!["task-a".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+                agent_profile: None,
         });
 
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();
@@ -1166,6 +1184,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![],
             estimated_complexity: None,
+                agent_profile: None,
         });
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();
 
@@ -1195,6 +1214,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![],
             estimated_complexity: None,
+                agent_profile: None,
         });
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();
 
@@ -1235,6 +1255,7 @@ mod tests {
                 depends_on: vec![],
                 outputs: vec![],
                 estimated_complexity: None,
+                agent_profile: None,
             });
         }
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();
@@ -1278,6 +1299,7 @@ mod tests {
                 depends_on: vec![],
                 outputs: vec![],
                 estimated_complexity: None,
+                agent_profile: None,
             });
         }
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();
@@ -1310,6 +1332,7 @@ mod tests {
                 depends_on: vec![],
                 outputs: vec![],
                 estimated_complexity: None,
+                agent_profile: None,
             });
         }
         db.create_tasks_from_graph(&run.id, &graph).await.unwrap();

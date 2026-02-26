@@ -272,8 +272,17 @@ impl WaveExecutor {
                     spawned_task_ids.insert(task.id.clone());
                     
                     // Build context for the task
-                    // Try to match task to an agent profile by codename
-                    let profile = self.db.get_profile_by_codename(&task.id).await.ok().flatten();
+                    // Get the assigned profile (from planner) or try codename match as fallback
+                    let profile = if let Some(ref profile_ref) = task.agent_profile {
+                        // Try as codename first, then as ID
+                        let p = self.db.get_profile_by_codename(profile_ref).await.ok().flatten();
+                        if p.is_some() { p } else {
+                            self.db.get_profile(profile_ref).await.ok().flatten()
+                        }
+                    } else {
+                        // Legacy fallback: try task ID as codename
+                        self.db.get_profile_by_codename(&task.id).await.ok().flatten()
+                    };
                     let context = self.build_agent_context(task, result_bus, &run.id, profile.as_ref());
                     let label = format!("dare-{}", task.id);
 
@@ -736,6 +745,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![PathBuf::from("src/main.rs")],
             estimated_complexity: None,
+                agent_profile: None,
         };
         
         let task2 = TaskNode {
@@ -744,6 +754,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![PathBuf::from("src/main.rs")], // Same file!
             estimated_complexity: None,
+                agent_profile: None,
         };
         
         let task3 = TaskNode {
@@ -752,6 +763,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![PathBuf::from("src/lib.rs")], // Different file
             estimated_complexity: None,
+                agent_profile: None,
         };
         
         let mut active = HashSet::new();
@@ -788,6 +800,7 @@ mod tests {
             depends_on: vec!["task1".to_string(), "task2".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+                agent_profile: None,
         };
         
         let context = bus.get_dependency_context(&task);

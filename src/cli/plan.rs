@@ -1,21 +1,26 @@
 //! `dare plan` command - Preview or generate execution plan
 
 use anyhow::Result;
+use std::sync::Arc;
 
 use crate::config::Config;
+use crate::db::Database;
 use crate::planner::Planner;
 
 use super::{PlanArgs, PlanFormat};
 
 /// Preview or generate execution plan
 pub async fn run(args: PlanArgs, config: &Config) -> Result<()> {
-    let planner = Planner::new(config);
-
     // Get or create task graph
     let graph = if let Some(ref description) = args.auto {
-        println!("🧠 Auto-planning: {}", description);
+        println!("🧠 Planning: {}", description);
         println!();
-        planner.auto_plan(description).await?
+        let db_path = config.database_path();
+        let db = Arc::new(Database::connect(&db_path).await?);
+        db.migrate().await?;
+        let planner = Planner::new(config, &db);
+        let council = planner.plan(description).await?;
+        planner.to_task_graph(&council)?
     } else if let Some(ref file) = args.file {
         println!("📋 Loading: {}", file.display());
         println!();
@@ -83,7 +88,8 @@ fn print_pretty(graph: &crate::dag::TaskGraph) {
         
         for task_id in task_ids {
             if let Some(node) = graph.nodes.get(task_id) {
-                println!("  ○ {} ", task_id);
+                let agent_tag = node.agent_profile.as_deref().unwrap_or("unassigned");
+                println!("  ○ {} [{}]", task_id, agent_tag);
                 
                 // Wrap description to 60 chars
                 let desc = &node.description;

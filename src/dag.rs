@@ -20,6 +20,9 @@ pub struct TaskNode {
     pub outputs: Vec<PathBuf>,
     #[serde(default)]
     pub estimated_complexity: Option<Complexity>,
+    /// Profile ID or codename of the agent assigned to this task
+    #[serde(default)]
+    pub agent_profile: Option<String>,
 }
 
 /// The complete task graph
@@ -239,6 +242,7 @@ mod tests {
             depends_on: vec!["nonexistent".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
 
         assert!(graph.validate().is_err());
@@ -253,6 +257,7 @@ mod tests {
             depends_on: vec!["b".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
         graph.add_task(TaskNode {
             id: "b".to_string(),
@@ -260,6 +265,7 @@ mod tests {
             depends_on: vec!["a".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
 
         assert!(graph.validate().is_err());
@@ -274,6 +280,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
         graph.add_task(TaskNode {
             id: "b".to_string(),
@@ -281,6 +288,7 @@ mod tests {
             depends_on: vec!["a".to_string()],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
         graph.add_task(TaskNode {
             id: "c".to_string(),
@@ -288,6 +296,7 @@ mod tests {
             depends_on: vec![],
             outputs: vec![],
             estimated_complexity: None,
+            agent_profile: None,
         });
 
         let waves = graph.compute_waves();
