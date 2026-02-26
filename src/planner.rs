@@ -53,10 +53,16 @@ impl<'a> Planner<'a> {
         let prompt = self.build_planner_prompt(description);
 
         // Spawn planner agent
-        let session_key = gateway
+        let session_key = match gateway
             .spawn_session("planner", "dare-planner", &prompt)
             .await
-            .context("Failed to spawn planner agent")?;
+        {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!("Failed to spawn planner agent: {}, using fallback decomposition", e);
+                return self.fallback_simple_decomposition(description);
+            }
+        };
 
         tracing::info!(session_key = %session_key, "Planner agent spawned");
         println!("  🧠 Planning agent spawned...");
