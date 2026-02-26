@@ -1,9 +1,12 @@
-//! Task planner - two-phase orchestration
+//! Task planner — single LLM call that decomposes AND casts
 //!
-//! Phase 1: Find the right decomposer agent (e.g., Blueprint) to break down the goal
-//! Phase 2: Cast the team - match/create agent profiles for each task
+//! Flow:
+//! 1. Spawn Blueprint agent with the goal + available profiles
+//! 2. Blueprint decomposes into tasks and assigns profiles
+//! 3. Blueprint posts structured JSON to council API
+//! 4. Planner reads council messages, parses the plan
 //!
-//! No generic agents. No keyword heuristics. Every task gets a real persona.
+//! No keyword heuristics. No string matching. The LLM decides everything.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -19,7 +22,6 @@ use crate::models::{AgentProfile, Complexity};
 
 /// Default profiles that ship with dare
 pub const DEFAULT_PROFILES: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
-    // (codename, name, role, expertise, personality, avatar_emoji, color)
     (
         "blueprint",
         "Blueprint",
@@ -111,7 +113,6 @@ impl Planner {
     /// Seed default profiles into the database (idempotent)
     pub async fn seed_default_profiles(&self) -> Result<()> {
         for (codename, name, role, expertise, personality, emoji, color) in DEFAULT_PROFILES {
-            // Skip if already exists
             if self.db.get_profile_by_codename(codename).await?.is_some() {
                 continue;
             }
@@ -126,264 +127,328 @@ impl Planner {
         Ok(())
     }
 
-    /// Full planning pipeline: decompose goal → cast team
-    ///
-    /// Phase 1: Pick a decomposer agent (Blueprint or best match) to break down the goal
-    /// Phase 2: For each task, assign the right agent profile
+    /// Plan a council: decompose goal + assign agent profiles in one LLM call
     pub async fn plan(&self, goal: &str) -> Result<PlannedCouncil> {
-        // Ensure default profiles exist
         self.seed_default_profiles().await?;
 
-        // Phase 1: Decompose the goal
-        println!("\n📐 Phase 1: Decomposing goal...");
-        let decomposition = self.decompose(goal).await?;
+        // Load available profiles for the prompt
+        let profiles = self.db.list_profiles(true).await?;
 
-        // Phase 2: Cast the team
-        println!("🎭 Phase 2: Casting the team...");
-        let council = self.cast_team(goal, decomposition).await?;
-
-        Ok(council)
+        // Try LLM-based planning via gateway
+        println!("\n📐 Planning council...");
+        match self.plan_via_llm(goal, &profiles).await {
+            Ok(council) => Ok(council),
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM planning failed, using fallback");
+                println!("  ⚠ LLM planning unavailable, using minimal fallback");
+                self.fallback_plan(goal)
+            }
+        }
     }
 
-    /// Phase 1: Find the best decomposer and break down the goal
-    async fn decompose(&self, goal: &str) -> Result<Decomposition> {
-        // Try LLM-based decomposition via gateway
-        let gateway_config = match GatewayConfig::load() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Cannot connect to gateway: {}", e);
-                return self.fallback_decompose(goal);
-            }
-        };
-
+    /// Spawn Blueprint agent to decompose + cast via council messages
+    async fn plan_via_llm(&self, goal: &str, profiles: &[AgentProfile]) -> Result<PlannedCouncil> {
+        let gateway_config = GatewayConfig::load().context("Gateway config not available")?;
         let (event_tx, mut event_rx) = mpsc::channel::<GatewayEvent>(100);
-        let gateway = match GatewayClient::connect(gateway_config, event_tx).await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!("Failed to connect to gateway: {}", e);
-                return self.fallback_decompose(goal);
-            }
-        };
-
-        // Get Blueprint profile for the decomposer prompt
-        let blueprint = self.db.get_profile_by_codename("blueprint").await?;
-        let prompt = self.build_decomposer_prompt(goal, blueprint.as_ref());
-
-        let session_key = match gateway
-            .spawn_session("planner", "dare-planner", &prompt)
+        let gateway = GatewayClient::connect(gateway_config, event_tx)
             .await
-        {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::warn!("Failed to spawn decomposer: {}, using fallback", e);
-                return self.fallback_decompose(goal);
-            }
-        };
+            .context("Failed to connect to gateway")?;
 
-        println!("  🧠 Blueprint is thinking...");
+        // Create a temporary run so Blueprint can post to council
+        let temp_run_id = format!("plan-{}", uuid::Uuid::new_v4().simple());
+        let temp_run = crate::models::Run::new(&format!("Planning: {}", short_title(goal)));
+        let run_id = temp_run.id.clone();
+        self.db.create_run(&temp_run).await?;
+
+        // Build the planning prompt
+        let prompt = self.build_planning_prompt(goal, profiles, &run_id);
+
+        // Spawn the planner agent
+        let session_key = gateway
+            .spawn_task("blueprint-planner", "dare-planner", &prompt)
+            .await
+            .context("Failed to spawn planner agent")?;
+
+        println!("  🧠 Blueprint is planning...");
 
         // Wait for completion
-        let timeout_dur = Duration::from_secs(180);
-        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let mut completed = false;
 
         loop {
             if tokio::time::Instant::now() > deadline {
-                tracing::warn!("Decomposer timed out");
                 let _ = gateway.kill_session(&session_key).await;
-                return self.fallback_decompose(goal);
+                anyhow::bail!("Planner agent timed out after 180s");
             }
 
             match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
                 Ok(Some(GatewayEvent::SessionCompleted { session_key: key }))
-                    if key == session_key =>
+                    if key == session_key || session_key.contains(&key) || key.contains(&session_key) =>
                 {
-                    println!("  ✓ Decomposition complete");
+                    completed = true;
                     break;
                 }
                 Ok(Some(GatewayEvent::SessionFailed { session_key: key, error }))
-                    if key == session_key =>
+                    if key == session_key || session_key.contains(&key) || key.contains(&session_key) =>
                 {
-                    tracing::warn!("Decomposer failed: {}", error);
-                    return self.fallback_decompose(goal);
+                    anyhow::bail!("Planner agent failed: {}", error);
+                }
+                Ok(None) => {
+                    anyhow::bail!("Gateway event channel closed");
                 }
                 _ => continue,
             }
         }
 
-        // TODO: Capture agent output and parse structured decomposition
-        // For now, fallback to LLM-less decomposition
-        // Once we can read session output, this will parse the YAML the decomposer produces
-        self.fallback_decompose(goal)
-    }
+        if !completed {
+            anyhow::bail!("Planner did not complete");
+        }
 
-    /// Build the prompt for the decomposer agent (Blueprint)
-    fn build_decomposer_prompt(&self, goal: &str, blueprint: Option<&AgentProfile>) -> String {
-        let identity = if let Some(p) = blueprint {
-            format!(
-                "You are **{name}** (codename: {codename}), {role}.\n{personality}\n\n",
-                name = p.name,
-                codename = p.codename,
-                role = p.role,
-                personality = p.personality,
-            )
-        } else {
-            "You are a technical planner. Break problems into clean, atomic tasks.\n\n".to_string()
+        println!("  ✓ Blueprint finished planning");
+
+        // Read the plan from council messages
+        // get_messages returns (id, task_id, msg_type, payload_json, created_at)
+        let messages = self.db.get_messages(&run_id, 50).await?;
+
+        // Find the structured plan message (tagged as "plan" in payload)
+        let plan_text = messages
+            .iter()
+            .rev()
+            .find_map(|(_id, _task_id, _msg_type, payload, _created)| {
+                let tag = payload.get("tag").and_then(|v| v.as_str());
+                let text = payload.get("text").and_then(|v| v.as_str());
+                if tag == Some("plan") {
+                    text.map(|t| t.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                // Fallback: last message's text field
+                messages.last().and_then(|(_id, _task_id, _msg_type, payload, _created)| {
+                    payload.get("text").and_then(|v| v.as_str()).map(|t| t.to_string())
+                })
+            });
+
+        let plan_text = match plan_text {
+            Some(text) => text,
+            None => {
+                tracing::warn!("No plan message found in council, falling back");
+                anyhow::bail!("Blueprint didn't post a plan to the council");
+            }
         };
 
+        // Parse the structured plan
+        self.parse_plan_response(&plan_text, profiles)
+    }
+
+    /// Build the prompt that tells Blueprint to decompose AND assign profiles
+    fn build_planning_prompt(&self, goal: &str, profiles: &[AgentProfile], run_id: &str) -> String {
+        let dashboard_port = self.config.dashboard.port;
+        let council_api = format!("http://127.0.0.1:{}/api/council/{}", dashboard_port, run_id);
+
+        // Format available profiles
+        let profiles_list = profiles
+            .iter()
+            .map(|p| {
+                format!(
+                    "- **{}** (`{}`): {} — {}",
+                    p.name, p.codename, p.role, p.expertise
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
         format!(
-            r#"{identity}# Your Mission
+            r#"# You are Blueprint — dare.run's Technical Planner
 
-Decompose this goal into a task graph that a team of AI agents can execute.
+You decompose goals into tasks and assign the right agent to each task.
 
-## Goal
+## Your Goal
 {goal}
 
-## Available Agent Roles
+## Available Agent Profiles
+{profiles_list}
 
-When suggesting agents for tasks, use these role types:
-- **backend** — APIs, databases, server logic
-- **frontend** — UI, HTML/CSS/JS, user-facing code
-- **architect** — System design, infrastructure, tech selection
-- **devops** — CI/CD, Docker, deployment, scripting
-- **security** — Auth, encryption, threat modeling
-- **testing** — Tests, QA, code review
-- **docs** — Documentation, READMEs, tutorials
-- **planner** — Further decomposition of complex sub-problems
+## What You Must Do
 
-## Output Format
+1. **Analyze** the goal — understand what needs to be built
+2. **Decompose** into atomic tasks (each completable by one agent in 2-10 minutes)
+3. **Assign** each task to the best agent profile from the list above
+4. **Post your plan** as structured JSON to the council API
 
-Output ONLY valid YAML:
+## Output
 
-```yaml
-name: "Short Council Name"
-description: "What this council achieves"
-tasks:
-  - id: unique_snake_case_id
-    description: "Detailed description of what this agent must do"
-    role: backend  # One of the roles above
-    depends_on: []
-    files: [path/to/file.rs]
+Post your plan to the council with tag "plan" as a JSON object. Use this exact curl command:
 
-  - id: another_task
-    description: "Another task"
-    role: frontend
-    depends_on: [unique_snake_case_id]
-    files: [templates/page.html]
+```bash
+curl -s -X POST {council_api}/post \
+  -H "Content-Type: application/json" \
+  -d '<YOUR_JSON_PLAN>'
+```
+
+The JSON must have this exact structure:
+
+```json
+{{
+  "sender": "blueprint",
+  "tag": "plan",
+  "text": "<ESCAPED_JSON_STRING>"
+}}
+```
+
+Where the `text` field contains a JSON string with this schema:
+
+```json
+{{
+  "name": "Short Council Name",
+  "description": "What this council achieves",
+  "tasks": [
+    {{
+      "id": "descriptive_snake_case_id",
+      "description": "Detailed description of what this agent must do",
+      "agent": "volt",
+      "depends_on": [],
+      "files": ["path/to/file.rs"]
+    }}
+  ]
+}}
 ```
 
 ## Rules
 
-1. Each task = one agent. Make it atomic (2-10 minutes of work).
-2. Use descriptive task IDs (e.g., `design_schema`, `implement_auth`, not `task-1`).
-3. Specify the `role` — this determines which agent persona gets assigned.
-4. Be explicit about dependencies.
-5. List all files each task creates or modifies.
-6. Tasks with no dependencies run in parallel.
-7. Think about the right ORDER: schema → models → services → handlers → tests → docs.
-8. Don't create unnecessary tasks. Fewer focused tasks > many trivial ones.
+1. **Every task MUST have an `agent` field** — the codename of the profile to assign.
+2. Pick the most suitable profile. If no profile fits well, use the closest match.
+3. Task IDs should be descriptive: `design_schema`, `implement_auth_handler` — NOT `task-1`.
+4. Each task = one agent. Make tasks atomic.
+5. Be explicit about dependencies — if B needs A's output, B depends_on A.
+6. List all files each task creates or modifies.
+7. Think about ordering: schema → models → services → handlers → tests → docs.
+8. Don't over-decompose. Fewer focused tasks > many trivial ones.
+9. The `text` field must be valid JSON (escape quotes properly).
 
-Output ONLY the YAML. No explanation before or after.
+## Important
+
+- Post EXACTLY ONE message with tag "plan"
+- The `text` field must be parseable as JSON
+- Do NOT post anything else — just the plan
+- Do NOT explain your reasoning, just output the curl command and execute it
 "#,
-            identity = identity,
             goal = goal,
+            profiles_list = profiles_list,
+            council_api = council_api,
         )
     }
 
-    /// Fallback decomposition when gateway is unavailable
-    /// Still produces role-annotated tasks, just without LLM intelligence
-    fn fallback_decompose(&self, goal: &str) -> Result<Decomposition> {
-        tracing::info!("Using fallback decomposition");
-        println!("  ⚠ Using local decomposition (no LLM available)");
+    /// Parse the structured plan response from Blueprint
+    fn parse_plan_response(&self, text: &str, profiles: &[AgentProfile]) -> Result<PlannedCouncil> {
+        // Try to parse the text as JSON directly
+        let plan: serde_json::Value = try_parse_json(text)
+            .context("Failed to parse Blueprint's plan as JSON")?;
 
-        // Single task with role inference from goal text
-        let role = infer_primary_role(goal);
+        let name = plan
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unnamed Council")
+            .to_string();
 
-        Ok(Decomposition {
-            name: short_title(goal),
-            description: goal.to_string(),
-            tasks: vec![DecomposedTask {
-                id: slugify(goal),
-                description: goal.to_string(),
-                role,
-                depends_on: vec![],
-                files: vec![],
-            }],
-        })
-    }
+        let description = plan
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-    /// Phase 2: For each decomposed task, find or create the right agent profile
-    async fn cast_team(&self, _goal: &str, decomposition: Decomposition) -> Result<PlannedCouncil> {
-        let profiles = self.db.list_profiles(true).await?;
-        let mut assignments: Vec<TaskAssignment> = Vec::new();
+        let tasks = plan
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .context("Plan missing 'tasks' array")?;
 
-        for task in &decomposition.tasks {
-            // Find best matching profile for this task's role
-            let profile = self.find_profile_for_role(&task.role, &profiles)
-                .or_else(|| {
-                    // No exact match — create a generic one for this role
-                    tracing::info!(role = %task.role, task = %task.id, "No profile for role, will use closest match");
-                    profiles.first() // Last resort: any active profile
-                });
+        let mut assignments = Vec::new();
 
+        for task in tasks {
+            let task_id = task
+                .get("id")
+                .and_then(|v| v.as_str())
+                .context("Task missing 'id'")?
+                .to_string();
+
+            let task_desc = task
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let agent_codename = task
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("volt")
+                .to_string();
+
+            let depends_on: Vec<String> = task
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let files: Vec<String> = task
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Resolve codename to profile
+            let profile = profiles.iter().find(|p| p.codename == agent_codename);
             let profile_id = profile.map(|p| p.id.clone());
-            let profile_codename = profile.map(|p| p.codename.clone());
+            let profile_codename = Some(agent_codename.clone());
 
-            if let Some(ref codename) = profile_codename {
-                println!("  {} → {} ({})", task.id, codename, task.role);
+            let agent_label = if let Some(p) = profile {
+                format!("{} {}", p.avatar_emoji, p.name)
             } else {
-                println!("  {} → unassigned ({})", task.id, task.role);
-            }
+                agent_codename.clone()
+            };
+            println!("  {} → {} ({})", task_id, agent_label, task_desc.chars().take(50).collect::<String>());
 
             assignments.push(TaskAssignment {
-                task_id: task.id.clone(),
-                description: task.description.clone(),
-                role: task.role.clone(),
-                depends_on: task.depends_on.clone(),
-                files: task.files.clone(),
+                task_id,
+                description: task_desc,
+                role: profile.map(|p| p.role.clone()).unwrap_or_default(),
+                depends_on,
+                files,
                 profile_id,
                 profile_codename,
             });
         }
 
         Ok(PlannedCouncil {
-            name: decomposition.name,
-            description: decomposition.description,
+            name,
+            description,
             assignments,
         })
     }
 
-    /// Match a role string to the best available profile
-    fn find_profile_for_role<'a>(&self, role: &str, profiles: &'a [AgentProfile]) -> Option<&'a AgentProfile> {
-        let role_lower = role.to_lowercase();
-
-        // Direct codename/role match
-        for p in profiles {
-            if p.codename == role_lower || p.role.to_lowercase().contains(&role_lower) {
-                return Some(p);
-            }
-        }
-
-        // Role keyword mapping
-        let mapping: &[(&[&str], &str)] = &[
-            (&["backend", "api", "server", "database", "db"], "volt"),
-            (&["frontend", "ui", "ux", "html", "css", "web"], "pixel"),
-            (&["architect", "design", "system", "infrastructure"], "architect"),
-            (&["devops", "deploy", "docker", "ci", "cd", "ops"], "forge"),
-            (&["security", "auth", "encrypt", "threat"], "cipher"),
-            (&["test", "qa", "review", "quality"], "sentinel"),
-            (&["doc", "readme", "write", "tutorial"], "scribe"),
-            (&["plan", "decompose", "break"], "blueprint"),
-        ];
-
-        for (keywords, codename) in mapping {
-            if keywords.iter().any(|k| role_lower.contains(k)) {
-                if let Some(p) = profiles.iter().find(|p| p.codename == *codename) {
-                    return Some(p);
-                }
-            }
-        }
-
-        None
+    /// Minimal fallback when gateway is unavailable — single task, no string matching
+    fn fallback_plan(&self, goal: &str) -> Result<PlannedCouncil> {
+        Ok(PlannedCouncil {
+            name: short_title(goal),
+            description: goal.to_string(),
+            assignments: vec![TaskAssignment {
+                task_id: slugify(goal),
+                description: goal.to_string(),
+                role: String::new(),
+                depends_on: vec![],
+                files: vec![],
+                profile_id: None,
+                profile_codename: None, // Truly unassigned — no guessing
+            }],
+        })
     }
 
     /// Convert a PlannedCouncil into a TaskGraph ready for execution
@@ -397,7 +462,7 @@ Output ONLY the YAML. No explanation before or after.
                 id: assignment.task_id.clone(),
                 description: assignment.description.clone(),
                 depends_on: assignment.depends_on.clone(),
-                outputs: assignment.files.iter().map(|f| PathBuf::from(f)).collect(),
+                outputs: assignment.files.iter().map(PathBuf::from).collect(),
                 estimated_complexity: Some(Complexity::Medium),
                 agent_profile: assignment.profile_codename.clone(),
             });
@@ -422,24 +487,6 @@ Output ONLY the YAML. No explanation before or after.
 
 // ── Data structures ──────────────────────────────────────────────────
 
-/// Output of Phase 1: decomposed tasks with roles
-#[derive(Debug, Clone)]
-pub struct Decomposition {
-    pub name: String,
-    pub description: String,
-    pub tasks: Vec<DecomposedTask>,
-}
-
-/// A task from the decomposer, before profile assignment
-#[derive(Debug, Clone)]
-pub struct DecomposedTask {
-    pub id: String,
-    pub description: String,
-    pub role: String,
-    pub depends_on: Vec<String>,
-    pub files: Vec<String>,
-}
-
 /// A task with its assigned agent profile
 #[derive(Debug, Clone)]
 pub struct TaskAssignment {
@@ -462,24 +509,47 @@ pub struct PlannedCouncil {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Infer the primary role from a goal description
-fn infer_primary_role(goal: &str) -> String {
-    let lower = goal.to_lowercase();
-    if lower.contains("test") || lower.contains("qa") {
-        "testing".to_string()
-    } else if lower.contains("deploy") || lower.contains("docker") || lower.contains("ci/cd") {
-        "devops".to_string()
-    } else if lower.contains("doc") || lower.contains("readme") {
-        "docs".to_string()
-    } else if lower.contains("ui") || lower.contains("frontend") || lower.contains("page") {
-        "frontend".to_string()
-    } else if lower.contains("security") || lower.contains("auth") {
-        "security".to_string()
-    } else if lower.contains("design") || lower.contains("architect") {
-        "architect".to_string()
-    } else {
-        "backend".to_string()
+/// Try to parse JSON from text that might have markdown code fences or other wrapping
+fn try_parse_json(text: &str) -> Option<serde_json::Value> {
+    // Try direct parse
+    if let Ok(v) = serde_json::from_str(text) {
+        return Some(v);
     }
+
+    // Try extracting from markdown code fence
+    let fenced = extract_code_block(text);
+    if let Some(code) = fenced {
+        if let Ok(v) = serde_json::from_str(&code) {
+            return Some(v);
+        }
+    }
+
+    // Try finding JSON object in the text
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str(&text[start..=end]) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract content from a markdown code block
+fn extract_code_block(text: &str) -> Option<String> {
+    let start_markers = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
+    for marker in start_markers {
+        if let Some(start) = text.find(marker) {
+            let content_start = start + marker.len();
+            if let Some(end) = text[content_start..].find("```") {
+                return Some(text[content_start..content_start + end].to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Generate a slug from text for task IDs
@@ -489,11 +559,10 @@ fn slugify(text: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    // Collapse underscores and trim
     let collapsed: String = slug
         .split('_')
         .filter(|s| !s.is_empty())
-        .take(5) // Max 5 words
+        .take(5)
         .collect::<Vec<_>>()
         .join("_");
     if collapsed.len() > 40 {
@@ -544,17 +613,54 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_role() {
-        assert_eq!(infer_primary_role("Build a REST API"), "backend");
-        assert_eq!(infer_primary_role("Write integration tests"), "testing");
-        assert_eq!(infer_primary_role("Design the UI for settings page"), "frontend");
-        assert_eq!(infer_primary_role("Set up Docker deployment"), "devops");
-    }
-
-    #[test]
     fn test_short_title() {
         assert_eq!(short_title("Short"), "Short");
         let long = "This is a very long description that goes on and on and should be truncated at some reasonable point";
         assert!(short_title(long).len() <= 80);
+    }
+
+    #[test]
+    fn test_try_parse_json() {
+        // Direct JSON
+        let json = r#"{"name": "test", "tasks": []}"#;
+        assert!(try_parse_json(json).is_some());
+
+        // JSON in code fence
+        let fenced = "Here's the plan:\n```json\n{\"name\": \"test\", \"tasks\": []}\n```\nDone.";
+        assert!(try_parse_json(fenced).is_some());
+
+        // JSON embedded in text
+        let embedded = "The plan is: {\"name\": \"test\", \"tasks\": []} and that's it.";
+        assert!(try_parse_json(embedded).is_some());
+    }
+
+    #[test]
+    fn test_parse_plan_json() {
+        let plan = r#"{
+            "name": "Auth System",
+            "description": "JWT auth",
+            "tasks": [
+                {
+                    "id": "design_schema",
+                    "description": "Design the DB schema",
+                    "agent": "architect",
+                    "depends_on": [],
+                    "files": ["migrations/001.sql"]
+                },
+                {
+                    "id": "implement_auth",
+                    "description": "Implement auth handlers",
+                    "agent": "volt",
+                    "depends_on": ["design_schema"],
+                    "files": ["src/auth.rs"]
+                }
+            ]
+        }"#;
+
+        let parsed: serde_json::Value = serde_json::from_str(plan).unwrap();
+        let tasks = parsed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["agent"].as_str().unwrap(), "architect");
+        assert_eq!(tasks[1]["agent"].as_str().unwrap(), "volt");
     }
 }
